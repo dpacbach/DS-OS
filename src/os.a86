@@ -1,0 +1,3046 @@
+;Short term notes:
+;
+;
+;
+;Long term Notes:
+;      * When you impement the file truncation code, don't forget to take into
+;        account files with 0 length.
+;
+;=============================================================================
+
+include macros.inc
+
+VERSION_MAJOR   = 1
+VERSION_MINOR   = 0                     ; version = 1.0
+NUM_BUFFS       = 16                    ; # MUST be a power of 2
+FIRST_MCB_SEG   = 81h                   ; first mcb -- right before kernel
+
+INT20_FG        = w[bp+06h]
+INT20_CS        = w[bp+04h]
+INT20_IP        = w[bp+02h]
+INT20_BP        = w[bp+00h]             ; this modifies bp but don't change it
+INT20_DS        = w[bp-02h]             ;   or it might disturb stack frames.
+INT20_ES        = w[bp-04h]
+INT20_AX        = w[bp-06h]
+INT20_CX        = w[bp-08h]             ; int 20h registers on the stack
+INT20_DX        = w[bp-0Ah]
+INT20_BX        = w[bp-0Ch]
+INT20_SP        = w[bp-0Eh]
+INT20_BPx       = w[bp-10h]             ; changing this won't do anything
+INT20_SI        = w[bp-12h]
+INT20_DI        = w[bp-14h]
+
+;=============================================================================
+
+        org     0
+
+        jmp     start
+
+        align   16
+
+first_mcb:
+        db      1                       ; type = dos owned
+        dw      ((END_KERNEL+15)/16)-1  ; length in paras
+        dw      0A000h                  ; next in chain = A000h = none
+        db      11 dup(0)               ; unused
+
+start:
+        cli
+        push    cs
+        pop     ss
+        mov     sp,offset kernel_stack  ; set ss:sp to our stack
+        sti
+
+        xor     ax,ax                   ; setup the int 20h handler
+        mov     es,ax
+        mov     w[es:20h*4],offset int_20_handler
+        mov     es:[20h*4+2],cs
+
+        mov     al,dh
+        test    dl,80h
+        jnz     hd_boot
+        mov     al,dl
+        add     al,'A'
+hd_boot:
+        call    push_drive              ; push the initial drive
+        call    push_drive
+
+load_cmd:
+        call    pop_drive
+
+        mov     al,cs:[logical_drive]
+        call    push_drive
+
+        push    cs
+        pop     ds
+        mov     ah,05h                  ; Load program and run it
+        mov     dx,offset cmd_struc
+        int     20h
+
+        mov     ah,10h                  ; print string(ASCIIZ)
+        mov     dx,offset cmd_no_find
+        int     20h
+        jmp     $
+
+;=============================================================================
+;= OPERATING SYSTEM KERNEL
+;=============================================================================
+
+int_20_handler:
+        push    bp
+        mov     bp,sp
+        push    ds
+        push    es
+        PUSH_A
+        mov     di,ax                   ; di = function number
+        BITMW   shr,di,8                ; di = AH
+        shl     di,1                    ; multiply by two for jump table
+        add     di,offset process_table
+        push    w[cs:di]                ; push the address of the function
+        mov     di,INT20_DI             ; restore di from stack
+        ret                             ; jump to process in jump table
+exit:
+        POP_A                           ; returning
+        pop     es
+        pop     ds
+        pop     bp
+        iret
+
+;=============================================================================
+
+;=============================================================================
+;=  USER INTERFACE INTERRUPT 20H FUNCTIONS                                   =
+;=============================================================================
+
+;=============================================================================
+;Name            ; ##h ; status ; check ; Description                        ;
+;=============================================================================
+;open_file       ; 00h ;  good  ;  no   ; opens a file using a file handle   ;
+;create_file     ; 01h ;  good  ;  no   ; creates a file using a file handle ;
+;delete_file     ; 02h ;  good  ;  no   ; deletes a file                     ;
+;find_first      ; 03h ;        ;  no   ; finds first matching file in root  ;
+;find_next       ; 04h ;        ;  no   ; finds next matching file in root   ;
+;load_prog       ; 05h ;        ;  no   ; loads into memory + can execute it ;
+;end_program     ; 06h ;  good  ;  no   ; ends program and returns control   ;
+;============================================================================;
+;close_file      ; 07h ;  good  ;  no   ; closes a file using a file handle  ;
+;read_file       ; 08h ;        ;  no   ; reads a file using a file handle   ;
+;write_file      ; 09h ;  good  ;  no   ; writes a file using a file handle  ;
+;seek_file       ; 0Ah ;        ;  no   ; moves the current file position    ;
+;============================================================================;
+;mem_allocate    ; 0Bh ;        ;  no   ; allocates a block of mem using mcb ;
+;mem_free        ; 0Ch ;        ;  no   ; frees a block of mem using mcb     ;
+;mem_resize      ; 0Dh ;        ;  no   ; resizes a block of mem using mcb   ;
+;============================================================================;
+;get_dta         ; 0Eh ;  good  ;  no   ; gets the address of the dta        ;
+;set_dta         ; 0Fh ;  good  ;  no   ; sets the address of the dta        ;
+;============================================================================;
+;print_string    ; 10h ;  good  ;  no   ; prints an ASCIIZ string to screen  ;
+;get_string      ; 11h ;  good  ;  no   ; gets ASCIIZ buffered input         ;
+;print_character ; 12h ;  good  ;  no   ; prints a character in teletype mode;
+;get_character   ; 13h ;  good  ;  no   ; gets one character from keyboard   ;
+;============================================================================;
+;name_expand     ; 14h ;  good  ;  no   ; expands a file name to 20 bytes    ;
+;drive_change    ; 15h ;  good  ;  no   ; changes the current drive          ;
+;get_drive       ; 16h ;  good  ;  no   ; gets the current logical drive     ;
+;get_version     ; 17h ;        ;  no   ; gets the version of the kernel     ;
+;set_invalidation; 18h ;  good  ;  no   ; set whether sectors are invalidated;
+;set_drv_caching ; 19h ;  good  ;  no   ; sets whether drv caching is enabled;
+;bin_to_ascii    ; 1Ah ;  good  ;  no   ; converts binary to ascii           ;
+;name_crunch     ; 1Bh ;        ;  no   ; crunches an expanded file name     ;
+;rename_file     ; 1Ch ;        ;  no   ; renames a file
+;=============================================================================
+
+rename_file:                            ; ds:si = source name
+                                        ; es:di = destination name
+        call    file_rename
+        db      0d6h                    ; salc. if carry, al=ff, else al=00
+        and     INT20_FG,0fffeh         ; reset carry on stack
+        and     ax,1                    ; iscolate first bit in ax(carry flag)
+        or      INT20_FG,ax             ; set carry on stack if ax = 1
+        jmp     exit
+
+;=============================================================================
+
+name_crunch:                            ; ds:dx = source expanded name
+                                        ; es:di = destination
+        mov     si,dx
+        call    crunch_name
+        jmp     exit
+
+;=============================================================================
+
+bin_to_ascii:                           ; es:di = buffer
+                                        ; cx:dx = number
+                                        ; bx = flags
+                                        ; al = alignment(optional)
+        xchg    cx,dx
+        xchg    ax,cx
+        call    binary_to_ascii
+        jmp     exit
+
+;=============================================================================
+
+set_drv_caching:                        ; al = 0/1
+        or      al,al
+        jz      caching_off
+        call    flush_drive_cache
+caching_off:
+        mov     [cs:drive_caching],al
+        jmp     exit
+
+;=============================================================================
+
+set_invalidation:                       ; al = 0/1
+        mov     b[cs:invalidation],1
+        call    flush_sectors
+        mov     cs:[invalidation],al
+        jmp     exit
+
+;=============================================================================
+
+get_version:                            ; ah = major version, al = minor
+        mov     ah,VERSION_MAJOR
+        mov     al,VERSION_MINOR
+        mov     INT20_AX,ax
+        jmp     exit
+
+;=============================================================================
+
+get_drive:                              ; ret: ax = current logical drive
+        mov     al,cs:[logical_drive]
+        xor     ah,ah
+        mov     INT20_AX,ax
+        jmp     exit
+
+;=============================================================================
+
+drive_change:                           ; al = logical drive
+                                        ; carry = status
+        call    make_upper
+        call    change_drive
+        db      0d6h                    ; salc. if carry, al=ff, else al=00
+        and     INT20_FG,0fffeh         ; reset carry on stack
+        and     ax,1                    ; iscolate first bit in ax(carry flag)
+        or      INT20_FG,ax             ; set carry on stack if ax = 1
+        jmp     exit
+
+;=============================================================================
+
+name_expand:                            ; ds:dx = ASCIIZ file name
+                                        ; es:di = buffer(no zero termination)
+                                        ; carry = status
+                                        ; ret: al = drive
+        mov     si,dx                   ; ds:si = ASCIIZ name
+        call    expand_name             ; expand it
+        mov     INT20_AX,ax             ; save drive
+        db      0d6h                    ; salc. if carry, al=ff, else al=00
+        and     INT20_FG,0fffeh         ; reset carry on stack
+        and     ax,1                    ; iscolate first bit in ax(carry flag)
+        or      INT20_FG,ax             ; set carry on stack if ax = 1
+        jmp     exit
+
+;=============================================================================
+
+get_string:                             ; ds:dx = buffer
+                                        ; cx = max(including zero)
+                                        ; ret: cx = length
+        jcxz    done_get_string         ; if max size is 0, than exit
+        push    ds
+        push    dx
+        pop     di
+        pop     es                      ; es:di = ds:dx = buffer
+        mov     si,cx                   ; si = max size of buffer
+        cld                             ; go forward
+get_chars:
+        xor     ah,ah
+        int     16h                     ; get a key from the BIOS
+        cmp     al,0dh                  ; if it a new line key?
+        je      end_line                ; if so, we're done
+        cmp     al,8                    ; is it a backspace?
+        je      back_space              ; if so, go back one
+                                        ; if we're here, the key is valid
+        cmp     cx,1                    ; have we maxed out the buffer?
+        jne     put_the_char            ; if not, store the char
+        mov     ax,0e07h                ; play bell -- we've maxed out the
+        int     10h                     ;              buffer
+        jmp     get_chars
+put_the_char:
+        stosb                           ; store the character in the buffer
+        mov     ah,0eh                  ; output the character
+        xor     bx,bx
+        int     10h
+        loop    get_chars               ; repeat this process
+back_space:                             ; if we're here, user pressed BKSP
+        cmp     cx,si                   ; is cursor already at the beginning?
+        je      get_chars               ; if so, we can't go back any more.
+good_back:                              ; go back one
+        xor     bx,bx
+        mov     ax,0e08h                ; move the cursor back one
+        int     10h
+        mov     ax,0e20h                ; overwrite character with a space
+        int     10h
+        mov     ax,0e08h                ; move it back again
+        int     10h
+        dec     di                      ; dec the buffer pointer
+        inc     cx                      ; increment position counter
+        jmp     get_chars               ; repeat process
+end_line:
+        xor     al,al                   ; store a 0 for end of line
+        stosb
+        xchg    si,cx                   ; cx = max buffer size
+        sub     cx,si                   ; cx = length of string(no incl null)
+        mov     INT20_CX,cx             ; store it in CX on stack
+done_get_string:
+        jmp     exit
+
+;=============================================================================
+
+print_character:                        ; al = character
+        mov     ah,0eh
+        xor     bx,bx
+        int     10h                     ; put the character using bios
+        jmp     exit
+
+;=============================================================================
+
+get_character:                          ; al = 1/0 = echo/no echo
+        mov     bl,al                   ; ret: al = ASCII, ah = scan code
+        xor     ah,ah
+        int     16h                     ; get key from BIOS
+        or      bl,bl                   ; should we display it?
+        jz      good_get_char           ; if not, skip the display code
+        push    ax
+        mov     ah,0eh
+        xor     bx,bx
+        int     10h                     ; display character using BIOS
+        pop     ax
+good_get_char:
+        mov     INT20_AX,ax
+        jmp     exit
+
+;=============================================================================
+
+end_program:                            ; Will end a program and return
+                                        ; control to the parent program.
+        push    ax                      ; save al = return code
+        mov     ax,cs:[current_psp]     ; ax = mcb seg of psp of program
+        inc     ax                      ; point it to the actual memory
+        mov     ds,ax                   ; ds = psp of program
+        mov     cx,10                   ; cx = 10 = max file handles
+close_next_sft:
+        push    cx                      ; save current file handle
+        mov     ax,[28]                 ; ax = program's file handle bitmap
+        shr     ax,cl                   ; put current handle's bit in carry
+        jnc     no_handle_here          ; jmp if this sft entry is not open
+        dec     cx                      ; make file handle # zero based
+        mov     si,cx
+        BITMW   shl,si,4                ; mul it by 16(each entry = 16 bytes)
+        add     si,96                   ; sft's start at offset 96 in psp
+        call    file_close              ; close the file in that sft entry
+no_handle_here:
+        pop     cx                      ; cx = current file handle
+        loop    close_next_sft          ; next
+
+        mov     ax,[24]                 ; setup IP to return control to
+        mov     cs:[return_control+1],ax
+        mov     ax,[26]                 ; setup CS to return control to
+        mov     cs:[return_control+3],ax
+
+        mov     ax,FIRST_MCB_SEG
+        mov     es,ax                   ; es = seg of first mcb
+find_an_mcb:
+        mov     ax,es:[3]               ; get next in chain
+        push    ax                      ; save it
+        mov     ax,ds                   ; ax = psp of program
+        cmp     es:[5],ax               ; is this program the owner of mcb?
+        jne     not_owned               ; if not, don't free it
+        mov     ax,es                   ; ax = mcb owned by closing program
+        call    free_mem                ; free it
+not_owned:
+        pop     es                      ; es = next mcb to check
+        mov     bx,es
+        cmp     bx,0a000h               ; are we at the end of the chain?
+        jne     find_an_mcb             ; if not, go to the next mcb
+
+        mov     ax,[34]                 ; ax = psp seg of parent
+        dec     ax                      ; point it to the mcb
+        mov     cs:[current_psp],ax     ; make it the current psp segment
+
+        mov     ax,ds                   ; ax = psp seg of program
+        dec     ax                      ; point it to the mcb
+        call    free_mem                ; free it
+
+        pop     bx                      ; bl = program's return code
+
+        cli                             ; disable interrupt for stack change
+        mov     ax,[30]                 ; ax = new SP
+        mov     sp,ax
+        mov     ax,[32]                 ; ax = new SS
+        mov     ss,ax
+
+        mov     ax,bx                   ; al = program's return code
+
+        clc                             ; clear carry -- successfull
+        sti                             ; enable interrupts
+        db      0eah                    ; jump to flush cache
+        dw      offset return_control,80h
+return_control:
+        db      0eah                    ; return control to wherever
+        dw      0,0
+
+;=============================================================================
+
+load_prog:                              ; Will run a program from a loading
+                                        ; structure.
+                                        ; ds:dx = load structure
+                                        ; ret: carry = status.
+                                        ; ret: if not fail, the end_program
+                                        ;      function will pass control to
+                                        ;      place specified in load struct
+                                        ;      with carry cleared and ax with
+                                        ;      the error code.
+                                        ; registers will be changed!
+        mov     si,dx                   ; save pointer to load_struc in si
+        xor     dx,dx
+        call    flush_sectors           ; flush all system sectors
+        push    cs
+        pop     es                      ; es = cs
+        mov     di,offset load_struct   ; es:di = load_struct
+        mov     cx,16                   ; clear the whole thing(16 words)
+        cld
+        rep     movsw                   ; do it
+        call    prog_load_struct        ; load the program into memory
+        jc      bad_prog_load           ; if error, exit
+        push    cs
+        pop     ds                      ; ds = cs
+        mov     [current_psp],ax        ; set new main psp segment to new one
+        dec     w[current_psp]          ; dec it -- point it to the mcb
+        mov     [dta_address+2],ax
+        mov     w[dta_address],256      ; make new dta in program's cmd line
+        cli                             ; disable int's for stack change
+        mov     ds,ax                   ; ds = psp of new program
+        mov     si,256
+        mov     di,256                  ; si/di are 256 on entry
+        add     ax,512/16               ; ax = seg of start of code
+        mov     cs:[run_it+3],ax        ; set the new CS to jump to
+        mov     w[cs:run_it+1],0        ; new IP = 0
+        xor     sp,sp                   ; sp = 0
+        mov     ss,ax                   ; ss = cs of new program
+        mov     es,ax                   ; es = cs of new program
+        mov     cx,cs:[load_struct+8]   ; cx = size of cmd line
+        xor     ax,ax
+        xor     bx,bx
+        xor     dx,dx                   ; ax/bx/dx are all zero on entry
+        sti                             ; re-enable interrupts
+        db      0eah                    ; jump to flush cache
+        dw      offset run_it,80h
+run_it:
+        db      0eah                    ; jump to new program
+        dw      0,0
+
+bad_prog_load:
+        or      INT20_FG,1              ; enable carry on stack -- error
+        jmp     exit
+
+;=============================================================================
+
+get_dta:                                ; no parameters
+                                        ; ret: bx:si = seg:off of dta
+        mov     ax,cs:[dta_address+2]   ; ax = seg of user dta
+        mov     INT20_BX,ax             ; return it in bx on stack
+        mov     ax,cs:[dta_address]     ; ax = offset of user dta
+        mov     INT20_SI,ax             ; store it in si on the stack
+        jmp     exit
+
+;=============================================================================
+
+set_dta:                                ; ds:si = seg:off of dta
+                                        ; ret: dta will be set to ds:si
+        mov     cs:[dta_address+2],ds   ; set new dta to ds:si
+        mov     cs:[dta_address],si
+        jmp     exit
+
+;=============================================================================
+
+find_next:                              ; ds:dx = ASCIIZ search string
+                                        ; cx = attributes
+                                        ; ret: carry = status
+                                        ; ret: user dta will be filled
+        mov     ax,cs:[dta_address+2]   ; ax = seg of user dta
+        mov     es,ax                   ; put it in es
+        mov     di,cs:[dta_address]     ; es:di = user dta
+        mov     ax,es:[di+30]           ; ax = entry in root to start from
+        inc     ax                      ; start at the next one
+        mov     cs:[find_data+24],ax    ; put starting entry in kernel dta
+find_next_entry_filled:
+        push    cs
+        pop     es                      ; es = cs
+        mov     di,offset find_data     ; es:di = internel(kernel) dta
+        mov     si,dx                   ; ds:si = ASCIIZ search string
+        call    expand_name             ; expand it into kernel dta
+        jc      bad_find_next           ; invalid search string? exit
+        call    push_drive
+        push    cs
+        pop     ds                      ; ds = cs
+        mov     [di+26],cx              ; put attributes into kernel dta
+        call    find_next_file          ; find next match
+        jc      bad_find_next_pop       ; not found? exit then
+        mov     si,offset find_data     ; cs/ds:si = dta(file name found)
+        mov     ax,[dta_address+2]      ; ax = seg of user dta
+        mov     es,ax                   ; put it in es
+        mov     di,[dta_address]        ; es:di = user dta
+        call    crunch_name             ; convert expanded name into 16.4
+        add     si,20                   ; ds:si = size of file found
+        add     di,22                   ; es:di = file size in user dta
+        cld                             ; go forward
+        mov     cx,10                   ; copy the rest of the dta
+        rep     movsb                   ; do it
+        clc                             ; carry = 0 = no error
+bad_find_next_pop:
+        pushf
+        call    pop_drive
+        popf
+bad_find_next:
+        db      0d6h                    ; salc. if carry, al=ff, else al=00
+        and     INT20_FG,0fffeh         ; reset carry on stack
+        and     ax,1                    ; iscolate first bit in ax(carry flag)
+        or      INT20_FG,ax             ; set carry on stack if ax = 1
+        jmp     exit
+
+;=============================================================================
+
+find_first:                             ; ds:dx = ASCIIZ search string
+                                        ; cx = attributes
+                                        ; ret: carry = status
+                                        ; ret: user dta will be filled
+        mov     w[cs:find_data+24],0
+        jmp     find_next_entry_filled
+
+;=============================================================================
+
+delete_file:                            ; ds:dx = ASCIIZ file name.  Do not
+                                        ;         delete a file while open!!!
+                                        ; ret: carry = status
+        mov     si,dx                   ; ds:si = ASCIIZ file name
+        call    file_delete             ; delete it
+        db      0d6h                    ; salc. if carry, al=ff, else al=00
+        and     INT20_FG,0fffeh         ; reset carry on stack
+        and     ax,1                    ; iscolate first bit in ax(carry flag)
+        or      INT20_FG,ax             ; set carry on stack if ax = 1
+        jmp     exit
+
+;=============================================================================
+
+create_file:                            ; ds:dx = ASCIIZ file name
+                                        ; cx = attributes
+                                        ; ret: carry = status
+                                        ; ret: bx = handle if successfull
+        mov     bx,cs:[current_psp]     ; get mcb seg of current prog's psp
+        inc     bx                      ; point it to the actual memory
+        mov     es,bx                   ; es = start of curr prog's psp
+        mov     bx,es:[28]              ; handle status bitmap
+        push    cx                      ; save attributes
+        mov     cx,10                   ; ten handles max
+find_blank_sft:
+        shr     bx,1                    ; put next handle status bit in carry
+        jnc     found_blank_sft         ; is it 0 = free?
+        loop    find_blank_sft          ; nope, try again
+        pop     cx                      ; restore attributes
+        jmp     fail_open               ; if we're here, there's no more left
+found_blank_sft:
+        mov     bx,10                   ; bx = 10 = max file handles
+        sub     bx,cx                   ; bx = 10 - [10 - free handle index]
+        mov     ax,bx                   ; save handle in ax
+        BITMW   shl,bx,4                ; bx *= 16. each sft = 16 bytes
+        add     bx,96                   ; sft's start at offset 96 in psp
+        BITMW   shr,bx,4                ; get # of paras from beg. of psp
+        mov     si,es         
+        add     bx,si                   ; add es to it. es = seg of psp
+        mov     si,dx                   ; ds:si = ASCIIZ name
+        pop     cx                      ; restore cx = attributes
+        xor     di,di
+        mov     es,bx                   ; es:di = sft
+        call    file_create             ; do it
+        push    ax                      ; save original handle
+        db      0d6h                    ; salc. if carry, al=ff, else al=00
+        and     INT20_FG,0fffeh         ; reset carry on stack
+        and     ax,1                    ; iscolate first bit in ax(carry flag)
+        or      INT20_FG,ax             ; set carry on stack if ax = 1
+        or      ax,ax                   ; test carry
+        pop     ax                      ; restore ax = original handle
+        jnz     error_create
+        mov     INT20_BX,ax             ; store handle in bx on stack
+        mov     cx,ax                   ; cx = handle
+        mov     ax,1                    ; initialize mask
+        shl     ax,cl                   ; shl mask [file handle] # of times
+        mov     bx,cs:[current_psp]     ; get mcb seg of current program
+        inc     bx                      ; point it to the actual memory
+        mov     es,bx                   ; es = psp
+        or      es:[28],ax              ; enable handle
+error_create:
+        jmp     exit
+
+;=============================================================================
+
+open_file:                              ; ds:dx = ASCIIZ file name
+                                        ; al = mode 0-read/1-write/2-r/w
+                                        ; ret: bx = handle if successfull
+                                        ; ret: carry = status
+        mov     bx,cs:[current_psp]     ; get mcb seg of current prog's psp
+        inc     bx                      ; point it to the actual memory
+        mov     es,bx                   ; es = start of curr prog's psp
+        mov     bx,es:[28]              ; handle status bitmap
+        mov     cx,10                   ; ten handles max
+find_empty_sft:
+        shr     bx,1                    ; put next handle status bit in carry
+        jnc     found_empty_sft         ; is it 0 = free?
+        loop    find_empty_sft          ; nope, try again
+        jmp     fail_open               ; if we're here, there's no more left
+found_empty_sft:
+        mov     bx,10                   ; bx = 10 = max file handles
+        sub     bx,cx                   ; bx = 10 - [10 - free handle index]
+        mov     cx,bx                   ; save handle in cx
+        BITMW   shl,bx,4                ; bx *= 16. each sft = 16 bytes
+        add     bx,96                   ; sft's start at offset 96 in psp
+        BITMW   shr,bx,4                ; get # of paras from beg. of psp
+        mov     di,es       
+        add     bx,di                   ; add es to it. es = seg of psp
+        push    ds                      ; switch ds and es
+        push    es
+        pop     ds                      ; ds = seg of start of program psp
+        pop     es                      ; es = seg of ASCIIZ file name
+        mov     di,dx                   ; es:di = ASCIIZ file name
+        mov     dl,al                   ; dl = access rights
+        call    file_open               ; try to open the file
+        jc      fail_open               ; not found? exit
+        mov     INT20_BX,cx             ; return handle in bx on stack
+        mov     bx,1                    ; initialize mask
+        shl     bx,cl                   ; set bit of new handle
+        or      [28],bx                 ; set the new bit in handle mask
+        clc                             ; carry = 0, successful
+fail_open:
+        db      0d6h                    ; salc. if carry, al=ff, else al=00
+        and     INT20_FG,0fffeh         ; reset carry on stack
+        and     ax,1                    ; iscolate first bit in ax(carry flag)
+        or      INT20_FG,ax             ; set carry on stack if ax = 1
+        jmp     exit
+
+;=============================================================================
+
+close_file:                             ; bx = handle
+        mov     ax,cs:[current_psp]     ; get mcb seg of current program's psp
+        inc     ax                      ; point it to the actual memory
+        mov     ds,ax                   ; put it in ds
+        mov     ax,1                    ; initialize bit mask
+        xchg    bx,cx                   ; cx = handle, bx = # of bytes to read
+        shl     ax,cl                   ; shl ax [file handle] # of times
+        xchg    bx,cx                   ; restore them
+        and     ax,[28]                 ; and mask with handle status bits
+        jz      bad_handle_close        ; is it 0 = handle not open?
+        not     ax                      ; reverse bits; disable curr. handle
+        and     [28],ax                 ; disable it
+        mov     si,bx                   ; si = file handle
+        BITMW   shl,si,4                ; mul by 16. each sft = 16 bytes
+        add     si,96                   ; sft's start at offset 96 in psp
+        call    file_close              ; close the file
+bad_handle_close:
+        jmp     exit
+
+;=============================================================================
+
+read_file:                              ; bx = handle
+                                        ; cx = # of bytes to read
+                                        ; ds:dx = place to read in to
+        mov     ax,cs:[current_psp]     ; get mcb seg of current program's psp
+        inc     ax                      ; point it to the actual memory
+        mov     es,ax                   ; put it in es
+        mov     ax,1                    ; initialize bit mask
+        xchg    bx,cx                   ; cx = handle, bx = # of bytes to read
+        shl     ax,cl                   ; shl ax [file handle] # of times
+        xchg    bx,cx                   ; restore them
+        and     ax,es:[28]              ; and mask with handle status bits
+        jz      bad_handle_read         ; is it 0 = handle not open?
+        push    ds
+        push    es
+        pop     ds                      ; switch ds and es
+        pop     es                      ; ds = psp, es = seg of place to write
+        mov     di,dx                   ; es:di = place to write
+        mov     si,bx                   ; si = handle
+        BITMW   shl,si,4                ; si *= 16. each sft 16 bytes
+        add     si,96                   ; sft's start at offset 96 in psp
+        call    file_read               ; ds:si = sft for out handle
+bad_handle_read:
+        mov     INT20_AX,ax             ; ax on stack = # of bytes read
+        jmp     exit
+
+;=============================================================================
+
+write_file:                             ; bx = handle
+                                        ; cx = # of bytes to write
+                                        ; ds:dx = bytes to write
+        mov     ax,cs:[current_psp]     ; get mcb seg of current program's psp
+        inc     ax                      ; point it to the actual memory
+        mov     es,ax                   ; put it in es
+        mov     ax,1                    ; initialize bit mask
+        xchg    bx,cx                   ; bx = # of bytes to read, cx = handle
+        shl     ax,cl                   ; shl ax [file handle] # of times
+        xchg    bx,cx                   ; restore them
+        and     ax,es:[28]              ; and mask with handle status bits
+        jz      bad_handle_write        ; is it 0 = handle not open?
+        mov     si,dx                   ; ds:si = bytes to write
+        BITMW   shl,bx,4                ; bx *= 16. each sft = 16 bytes
+        add     bx,96                   ; sft's start at offset 96 in psp
+        call    file_write              ; es:bx = sft for our handle
+bad_handle_write:
+        mov     INT20_AX,ax             ; ax on stack = # of bytes written
+        jmp     exit
+
+;=============================================================================
+
+seek_file:                              ; al = 0/1/2, from beg. mid. end
+                                        ; bx = file handle
+                                        ; cx:dx = seek distance
+                                        ; ret dx:ax = file position
+        push    es
+        mov     di,cs:[current_psp]     ; get MCB seg of current proc's PSP
+        inc     di                      ; point it to the actual memory start
+        mov     es,di                   ; es = PSP of current process
+        xchg    cx,dx                   ; dx:cx = seek distance
+        xchg    ax,cx                   ; dx:ax = seek dist., cx = from where
+        xchg    bx,cx                   ; bx = from where, cx = handle
+        mov     di,1                    ; initialize mask
+        shl     di,cl                   ; shift left [file handle] # of times
+        and     di,es:[28]              ; and with the SFT open/close mask
+        jnz     good_handle_seek        ; if it's a valid SFT, then good
+        xor     ax,ax
+        cwd                             ; dx:ax = 0, no file so no position
+        jmp     done_seeking
+good_handle_seek:
+        mov     di,cx                   ; di = file handle
+        BITMW   shl,di,4                ; multiply it by 16(SFT = 16 bytes)
+        add     di,96                   ; SFT starts at offset 96 in PSP
+        and     bx,3                    ; make [from where] be either 0/1/2
+        call    file_seek               ; do it
+        mov     ax,es:[di+1]            ; ax = low word of file position
+        mov     INT20_AX,ax             ; return it on stack in ax
+        mov     ax,es:[di+3]            ; ax = high word of file position
+        mov     INT20_DX,ax             ; return it on stack in dx
+done_seeking:
+        pop     es
+        jmp     exit
+
+;=============================================================================
+
+print_string:                           ; ds:dx points to string
+        mov     si,dx                   ; ds:si = string
+        cld
+print_loop:
+        lodsb                           ; get next character
+        or      al,al                   ; is it zero?
+        jz      end_string              ; if so, we're done
+        mov     ah,0eh                  ; function 0eh-print character
+        xor     bx,bx                   ; video page 0
+        int     10h
+        jmp     print_loop
+end_string:
+        jmp     exit
+
+;=============================================================================
+
+mem_allocate:                           ; bx = # of paras to allocate
+                                        ; ret: ax = address, 0 if fail
+                                        ; if fail, bx = biggest mcb available
+        mov     ax,cs:[current_psp]     ; start at current program's psp
+        mov     cx,ax
+        call    allocate_mem
+        mov     INT20_BX,di
+        mov     INT20_AX,ax             ; address in ax
+        jmp     exit
+
+;=============================================================================
+
+mem_free:                               ; bx = address of memory to free
+        lea     ax,[bx-1]               ; ax = bx-1. ax = the mcb
+        call    free_mem                ; try to free it
+        jmp     exit
+
+;=============================================================================
+
+mem_resize:                             ; bx = start of memory to resize
+                                        ; cx = size in paras to resize
+                                        ; ret: bx = max mem available for mcb
+                                        ; carry = 1 if fail
+        lea     ax,[bx-1]               ; ax = bx-1. ax = the mcb
+        inc     cx                      ; add mcb seg
+        call    resize_mem              ; try to resize it
+        dec     bx                      ; take out mcb in max mem available
+        mov     INT20_BX,bx             ; return max mem in bx
+        db      0d6h                    ; salc. if carry, al=ff, else al=00
+        and     INT20_FG,0fffeh         ; reset carry on stack
+        and     ax,1                    ; iscolate first bit in ax(carry flag)
+        or      INT20_FG,ax             ; set carry on stack if ax = 1
+        jmp     exit
+
+;=============================================================================
+
+;=============================================================================
+;=  SUB PROCESSES AND SUPPORT CODE                                           =
+;=============================================================================
+
+file_rename:                            ; ds:si = source file name
+                                        ; es:di = dest file name
+        push    es
+        push    di
+        push    ds
+        push    si
+        push    es
+        push    di
+        pop     si
+        pop     ds
+        push    cs
+        pop     es
+        xor     dx,dx
+        call    flush_sectors
+        mov     di,offset find_data
+        call    expand_name
+        jc      error_file_rename2
+        call    push_drive
+        mov     w[cs:find_data+26],0ffffh
+        call    find_first_file
+        jnc     error_file_rename
+        push    cs
+        pop     ds
+        mov     si,offset find_data
+        mov     di,offset file_name_exp
+        mov     cx,20
+        cld
+        rep     movsb
+        pop     si
+        pop     ds
+        push    ds
+        push    si
+        mov     di,offset find_data
+        call    expand_name
+        jc      error_file_rename
+        cmp     al,cs:[logical_drive]
+        jne     error_file_rename
+        mov     ax,cs:[find_data+28]
+        BITMW   shl,ax,5
+        mov     dx,ax
+        BITMW   shr,ax,9
+        add     ax,cs:[fat_end]
+        call    read_sector_cache
+        call    modify_sector
+        and     dx,200h-1
+        add     bx,dx
+        mov     di,bx
+        push    cs
+        pop     ds
+        mov     si,offset file_name_exp
+        mov     cx,20
+        rep     movsb
+        call    pop_drive
+        clc
+        jmp     done_file_rename
+error_file_rename:
+        call    pop_drive
+error_file_rename2:
+        stc
+done_file_rename:
+        pop     si
+        pop     ds
+        pop     di
+        pop     es
+        ret
+
+;=============================================================================
+
+binary_to_ascii:                        ; (dx:ax)/(ax)/(al) = binary number
+                                        ; size depends on size bits in bx
+                                        ; es:di = buffer
+                                        ; cl    = if align bit is set(align
+                                        ;         right), cl is size of align
+                                        ;=====================================
+                                        ; bx    = flags
+                                        ;         
+                                        ; |C|B|A|9|8|7|6|5|4|3|2|1|0|
+                                        ;  | | | | | | | | | | | | |
+                                        ;  | | | | | | | | | | | | |
+                                        ;  | | | | | | | | | | | ^-^-base
+                                        ;  | | | | | | | | | | ^-----align
+                                        ;  | | | | | | | | | ^-------put base
+                                        ;  | | | | | | | | ^---------hex case
+                                        ;  | | | | | | | ^-----------pad h/b
+                                        ;  | | | | | | ^-------------dec sign
+                                        ;  | | | | | ^---------------base case
+                                        ;  | | | | ^-----------------pad char
+                                        ;  | | ^-^-------------------size
+                                        ;  | ^-----------------------zero hex
+                                        ;  ^-------------------------dec comma
+                                        ;
+                                        ;  All other bits should be zero.
+                                        ;
+                                        ;      Base: 0 = decimal   1 = hex
+                                        ;            2 = binary    3 = octal
+                                        ;
+                                        ;     Align: 0 = left      1 = right
+                                        ;
+                                        ;  Hex case: 0 = lower     1 = upper
+                                        ;
+                                        ;  Dec sign: 0 = unsigned  1 = signed
+                                        ;
+                                        ; Base case: 0 = lower     1 = upper
+                                        ;
+                                        ;  Pad what: 0 = zero's    1 = spaces
+                                        ;
+                                        ;      Size: 0 = nibble    1 = byte
+                                        ;            2 = word      3 = dword
+                                        ;
+                                        ;  Zero hex: 0 = no zero,1 = yes zero
+                                        ;=====================================
+        push    ds
+        PUSH_A
+        push    cs
+        pop     ds
+
+        mov     [btoa_align],cl
+        mov     [btoa_flags],bx
+        mov     bx,3
+        and     bx,[btoa_flags]
+        or      bx,bx
+        jnz     $+5
+        jmp     near binary_to_decimal
+        dec     bx
+        jnz     $+5
+        jmp     near binary_to_hex
+        dec     bx
+        jnz     $+5
+        jmp     near binary_to_binary
+
+binary_to_octal:
+binary_to_binary:
+binary_to_hex:
+
+binary_to_decimal:
+        push    es
+        push    di
+        push    cs
+        pop     es
+        mov     di,offset convert_buffer
+        cld
+
+        mov     bx,600h
+        and     bx,[btoa_flags]
+        xchg    bl,bh
+        shr     bx,1
+        cmp     bl,3
+        je      decimal_dd
+        cmp     bl,2
+        je      decimal_dw
+        cmp     bl,1
+        je      decimal_db
+        mov     cl,4
+        shl     al,cl
+        sar     al,cl
+decimal_db:
+        cbw
+decimal_dw:
+        cwd
+decimal_dd:
+
+        mov     b[dec_sign],0
+        test    b[btoa_flags],40b
+        jz      no_put_sign
+        test    dh,80h
+        jz      no_put_sign
+        not     ax
+        not     dx
+        add     ax,1
+        adc     dx,0
+        inc     b[dec_sign]
+no_put_sign:
+
+        mov     cx,3b9ah
+        mov     bx,0ca00h               ; cx:bx = 1,000,000,000
+convert_to_decimal:
+        push    cx
+        push    bx
+        call    div32_32
+        add     bl,'0'
+        mov     [di],bl
+        inc     di
+        pop     bx
+        pop     cx
+        or      cx,cx
+        jnz     not_1_yet
+        cmp     bx,1
+        je      decimal_converted
+not_1_yet:
+        push    dx
+        push    ax
+        mov     dx,cx
+        mov     ax,bx
+        xor     cx,cx
+        mov     bx,10
+        call    div32_32
+        pop     ax
+        pop     dx
+        jmp     convert_to_decimal
+
+decimal_converted:
+        mov     b[di],0
+        mov     cx,10
+        mov     di,offset convert_buffer
+        mov     al,'0'
+        repe    scasb
+        jne     found_a_number
+        mov     di,offset convert_buffer+1
+        jmp     removed_decimal_zeros
+found_a_number:
+        dec     di
+        mov     cx,offset convert_buffer+10
+        sub     cx,di
+        mov     si,di
+        mov     di,offset convert_buffer
+        cld
+        rep     movsb
+removed_decimal_zeros:
+
+        mov     cx,di
+        sub     cx,offset convert_buffer
+        mov     si,offset convert_buffer
+        mov     di,offset convert_buffer2
+
+        cmp     b[dec_sign],0
+        je      no_output_sign
+        mov     al,'-'
+        stosb
+no_output_sign:
+        cld
+        mov     bx,di
+        rep     movsb
+
+        test    w[btoa_flags],1000h
+        jz      no_decimal_commas
+
+        mov     cx,si
+        sub     cx,offset convert_buffer
+        mov     ax,cx
+        mov     cl,3
+        div     cl
+        or      al,al
+        jz      no_decimal_commas
+        or      ah,ah
+        jnz     go_ahead_with_commas
+        dec     al
+        jz      no_decimal_commas
+go_ahead_with_commas:
+        mov     si,offset convert_buffer
+        mov     di,bx
+        mov     cl,ah
+        xor     ch,ch
+        rep     movsb
+        mov     cl,al
+        mov     al,','
+put_next_comma:
+        stosb
+        movsb
+        movsb
+        movsb
+        loop    put_next_comma
+
+no_decimal_commas:
+        test    w[btoa_flags],8
+        jz      no_put_decimal_base
+        mov     al,'d'
+        test    w[btoa_flags],80h
+        jz      decimal_base_lower
+        sub     al,32
+decimal_base_lower:
+        stosb
+no_put_decimal_base:
+        xor     al,al
+        stosb
+        dec     di
+        mov     cx,di
+        sub     cx,offset convert_buffer2
+        pop     di
+        pop     es
+        mov     si,offset convert_buffer2
+        jmp     align_it
+
+
+
+align_it:                               ; es:di = original buffer.
+                                        ; si = final string
+                                        ; cx = length(not including 0)
+        push    cx
+        test    w[btoa_flags],4
+        jz      no_align_number
+        xor     ah,ah
+        mov     al,[btoa_align]
+        cmp     al,cl
+        jb      no_align_number
+        sub     al,cl
+        mov     cx,ax
+        mov     al,20h
+        cld
+        rep     stosb
+no_align_number:
+        pop     cx
+        cld
+        rep     movsb
+        xor     al,al
+        stosb
+
+done_binary_to_ascii:
+        POP_A
+        pop     ds
+        ret
+
+;=============================================================================
+
+btoa_flags      dw 0
+btoa_align      db 0
+convert_buffer  db 20 dup(0)
+convert_buffer2 db 20 dup(0)
+dec_sign        db 0
+
+;=============================================================================
+
+load_pgrm:                              ; Will load a PGRM file into memory.
+                                        ; cs:si = sft of open program
+                                        ; bx = para of memory to load
+        push    ds
+        push    es
+        PUSH_A                          ; save all modified registers
+        push    cs
+        pop     ds                      ; ds = cs
+        mov     cx,0ffffh               ; try to read 65536 bytes
+        mov     es,bx                   ; es:[0] = seg of sft
+        xor     di,di                   ; es:di = seg of sft
+        call    file_read               ; read it
+        or      ax,ax                   ; did we read bytes?
+        jnz     read_some_bytes
+        stc
+read_some_bytes:
+        POP_A
+        pop     es
+        pop     ds                      ; restore all regs
+        ret
+        
+;=============================================================================
+
+prog_load_struct:                       ; Will LOAD a program into memory
+                                        ; only from the 'load_struct'
+                                        ; program loading structure.
+                                        ; ret: ax = seg of psp
+                                        ; carry = status
+        push    ds
+        push    es
+
+        les     di,cs:[load_struct]     ; es:di = program's ASCIIZ name
+        xor     dl,dl                   ; open in read only mode
+        mov     bx,(offset os_sft/16)+80h ; bx = seg of kernel's sft
+        call    file_open               ; attempt to open the file
+        jc      bad_struc               ; error? exit
+
+        push    cs
+        pop     ds
+        push    cs
+        pop     es                      ; es = ds = cs
+
+        mov     bx,1020h ;(65536+512)/16; bx = allocate 65536+512 bytes
+        mov     ax,[current_psp]        ; start at current program's psp
+        mov     cx,ax                   ; owner is current psp
+        call    allocate_mem            ; try to allocate it
+        or      ax,ax                   ; is ax = 0 = fail?
+        jz      bad_struc               ; exit then
+
+        inc     ax                      ; ax = the start of new memory
+        mov     es,ax
+        xor     di,di                   ; es:di = new memory
+        cld                             ; go forward
+
+        mov     ax,[load_struct+8]
+        stosw                           ; store size of cmd line
+
+        lds     si,cs:[load_struct]
+        mov     cx,22
+        rep     movsb                   ; store ASCIIZ program name in psp
+
+        push    cs
+        pop     ds                      ; ds = cs
+
+        mov     si,offset load_struct+12
+        movsw
+        movsw                           ; store cs:ip to return to
+
+        xor     ax,ax
+        stosw                           ; store the sft bitmap
+
+        movsw
+        movsw                           ; store ss:sp to use when returning
+
+        mov     ax,[load_struct+10]
+        stosw                           ; store psp seg of owner
+
+        mov     di,256                  ; es:di = new program's command line
+        lds     si,cs:[load_struct+4]   ; ds:si = command line of program
+        mov     cl,cs:[load_struct+8]   ; cl = length of command line
+        xor     ch,ch
+        inc     cx                      ; add 1 for null zero
+        inc     cx                      ; add 1 for rounding
+        shr     cx,1                    ; divide by 2
+        rep     movsw                   ; move words
+
+        push    cs
+        pop     ds
+
+        mov     si,offset os_sft        ; cs:si = os_sft
+        mov     bx,es                   ; bx = start of psp
+        add     bx,512/16               ; bx = start of code
+        call    load_pgrm               ; try to load the program
+
+        pushf                           ; save carry for possible error
+        call    file_close              ; close the file
+        popf
+
+        jc      bad_struc
+
+        mov     ax,es                   ; ax = start of psp of new program
+        clc                             ; no error
+        jmp     done_load_struc
+
+bad_struc:
+        stc
+done_load_struc:
+        pop     es
+        pop     ds
+        ret
+
+;=============================================================================
+
+crunch_name:                            ; ds:si = source expanded name--must
+                                        ;         be 20 bytes padded with
+                                        ;         spaces.  Must be a valid
+                                        ;         name!!!
+                                        ; es:di = destination.  Should be 22
+                                        ;         bytes for a 16 byte name, 4
+                                        ;         byte extention, dot, and 0.
+        push    ax
+        push    cx
+        push    di
+        push    si                      ; save modified registers
+        mov     cx,16                   ; file name could be up to 16 bytes
+copy_name_crunch:
+        movsb                           ; copy next file name character
+        cmp     b[si],20h               ; is next character a space?
+        je      done_name_crunch        ; if so, we're done the name
+        loop    copy_name_crunch        ; otherwise, copy next character
+done_name_crunch:
+        mov     al,'.'                  ; dot for between name and extention
+        stosb                           ; store it after file name
+        pop     si                      ; restore si = start of source name
+        push    si                      ; save it again
+        add     si,16                   ; ds:si = start of source extention
+        mov     cx,4                    ; extention could be up to 4 bytes
+copy_ext_crunch:
+        lodsb                           ; get next character of extention
+        cmp     al,20h                  ; is it a space?
+        je      done_ext_crunch         ; if so, we're done.
+        stosb                           ; otherwise store it
+        loop    copy_ext_crunch         ; do next byte
+done_ext_crunch:
+        cmp     b[di-1],'.'             ; if it's a dot, there's no extention
+        jne     has_ext_crunch          ; otherwise it has one
+        dec     di                      ; es:di = extention in destination.
+has_ext_crunch:                         ;         store a zero over it
+        xor     al,al                   ; store a zero at end of file name
+        stosb
+        pop     si
+        pop     di
+        pop     cx
+        pop     ax                      ; restore saved regs
+        ret
+
+;=============================================================================
+
+file_delete:                            ; ds:si = ASCIIZ file name.  Do not
+                                        ;         delete an open file!!!
+                                        ; ret: carry = status
+        push    ds
+        push    es                      ; save modified seg regs
+        PUSH_A
+        xor     dx,dx                   ; flush system sectors
+        call    flush_sectors           ; flush 'em
+        push    cs
+        pop     es                      ; es = cs
+        mov     di,offset find_data     ; es:di = dta for find_first_file
+        call    expand_name             ; expand name into dta
+        jc      bad_file_delete_no_pop  ; exit if file name is invalid
+        call    push_drive
+        push    cs
+        pop     ds                      ; ds = cs
+        mov     w[di+26],0ffffh         ; attributes = all files
+        call    find_first_file         ; find it
+        jc      bad_file_delete         ; not found? exit then
+        mov     ax,[di+24]              ; ax = starting sector of file
+        call    delete_chain            ; delete all the file sectors
+        mov     ax,[di+28]              ; get file's entry in the root table
+        BITMW   shl,ax,5                ; mul by 32(each root entry = 32)
+        mov     dx,ax                   ; store it in dx for indexing
+        BITMW   shr,ax,9                ; div by 512(get root sector)
+        add     ax,cs:[fat_end]         ; root table start
+        call    read_sector_cache       ; read the root sector
+        call    modify_sector           ; sector will modified
+        and     dx,200h-1               ; mod by 512(get offset in sector)
+        add     bx,dx                   ; cs:bx = file's entry in root table
+        mov     di,bx                   ; es:di = file's entry in root table
+        mov     cx,32                   ; clear the whole entry
+        mov     al,20h                  ; fill it with 20h's
+        rep     stosb                   ; clear it
+        xor     dx,dx                   ; reflush sectors
+        call    flush_sectors
+        call    pop_drive
+        clc                             ; carry = 0 = no error
+        jmp     done_delete
+bad_file_delete:
+        call    pop_drive
+bad_file_delete_no_pop:
+        stc                             ; carry = 1 = error
+done_delete:
+        POP_A
+        pop     es                      ; restore seg regs
+        pop     ds
+        ret
+
+;=============================================================================
+
+delete_chain:                           ; ax = starting sector.  All sectors
+                                        ;      including ax will be deleted.
+        push    ax
+        push    bx
+        push    dx
+        push    ds                      ; save the modified registers
+        cmp     ax,0ffffh               ; is starting sector EOF?
+        je      done_delete_chain       ; if so, we're already done.
+        push    cs
+        pop     ds                      ; ds = cs
+        xor     dx,dx                   ; flush only system sectors
+        call    flush_sectors           ; flush 'em
+delete_loop:
+        shl     ax,1                    ; mul by 2. FAT entry = 2 bytes
+        mov     dx,ax                   ; save in dx for indexing
+        BITMW   shr,ax,9                ; divide by 512(get FAT sector)
+        inc     ax                      ; FAT starts at sector 1.
+        call    read_sector_cache       ; read the FAT sector
+        and     dx,200h-1               ; mod by 512(get offset in sector)
+        add     bx,dx                   ; ds:[bx] = FAT entry
+        mov     ax,[bx]                 ; ax = FAT entry of next sector
+        mov     w[bx],0                 ; free it(put 0 into it)
+        call    modify_sector           ; sector has been modified
+        cmp     ax,0ffffh               ; is next sector EOF?
+        jne     delete_loop             ; if not, repeat the loop
+done_delete_chain:
+        pop     ds
+        pop     dx
+        pop     bx
+        pop     ax                      ; restore modified registers
+        ret
+
+;=============================================================================
+
+check_name_char:                        ; al = character to be tested to see
+                                        ;      if it would be valid in a file
+                                        ;      name.
+                                        ; ret: carry = 1 if error
+        push    ax
+        push    bx                      ; save ax and bx
+        mov     bx,offset character_table ; bx points to character table
+        cs:xlat                         ; al <- cs:bx+al
+        pop     bx                      ; restore bx
+        cmp     al,'.'                  ; is al '.' = invalid?
+        pop     ax                      ; restore ax
+        je      bad_char                ; if so it's bad
+        clc                             ; carry = 0 = good char
+        ret
+bad_char:
+        stc                             ; carry = 1 = bad char
+        ret
+
+;=============================================================================
+
+file_create:                            ; ds:si = ASCIIZ name
+                                        ; cx = attributes
+                                        ; es:di = sft
+                                        ; ret: carry = 1 if error
+        push    ds
+        PUSH_A
+        push    es
+        push    di                      ; save sft pointer
+        push    cx                      ; save attributes
+        push    cs
+        pop     es                      ; es = cs
+        mov     di,offset file_name_exp ; es:di = place to expand name into
+        call    expand_name             ; expand it(pad it with spaces)
+        jnc     good_expand_create
+        jmp     bad_create_no_pop       ; bad name
+good_expand_create:
+        call    push_drive
+
+        xor     dx,dx
+        call    flush_sectors
+
+        push    di
+        push    cx                      ; save these regs
+        mov     cx,20                   ; check the 20 chars in the file name
+        mov     al,'*'                  ; check for a '*'(an invalid char)
+        cld
+        repne   scasb                   ; search for it
+        pop     cx
+        pop     di                      ; restore the regs
+        jne     good_name_create
+        jmp     bad_create              ; found it? then invalid file name
+
+good_name_create:
+        push    cs
+        pop     ds                      ; ds = cs
+        mov     di,offset find_data     ; es:di = find_data
+        mov     si,offset file_name_exp ; ds:si = expanded file name
+        mov     cx,20                   ; file name = 20 bytes expanded
+        rep     movsb                   ; copy it
+        add     di,6                    ; es:di = attributes
+        mov     ax,0ffffh               ; search for files with all attributes
+        stosw                           ; store it
+        call    find_first_file         ; try to find this file
+        jc      find_new                ; error? exit then
+                                        ; if we're here, the file exists, and
+                                        ; has to be truncated to zero length
+        mov     ax,cs:[find_data+24]    ; ax = starting sector of file
+        call    delete_chain            ; delete all sectors in file
+        mov     ax,cs:[find_data+28]
+        BITMW   shl,ax,5
+        mov     dx,ax
+        BITMW   shr,ax,9
+        add     ax,cs:[fat_end]
+        call    read_sector_cache
+        and     dx,200h-1
+        add     bx,dx
+        add     bx,20
+        mov     w[cs:bx],0
+        mov     w[cs:bx+2],0
+        call    modify_sector
+
+        jmp     already_exists
+find_new:
+        mov     di,offset find_data     ; es:di = internal dta for find_first
+        mov     cx,20                   ; store 20 bytes
+        cld                             ; go forward
+        mov     al,20h                  ; store spaces
+        rep     stosb                   ; fill name with spaces
+        add     di,6                    ; es:di = attributes
+        mov     ax,0ffffh               ; 0ffffh - all files
+        stosw                           ; put it in
+        call    find_first_file         ; find empty directory entry
+        jc      bad_create
+
+already_exists:
+        mov     cx,1                    ; start at first FAT sector
+find_sector_create:
+        mov     ax,cx                   ; ax = next FAT sector to search
+        call    read_sector_cache       ; read next FAT sector
+        mov     di,bx                   ; cs:di = buffer
+        push    cx                      ; save current FAT sector
+        mov     cx,200h/2               ; scan 100h words
+        xor     ax,ax                   ; search for 0000h(empty sector)
+        repne   scasw                   ; do it
+        pop     cx                      ; cx = current FAT sector
+        je      found_sector_create     ; did we find a 0000h(empty sector)
+        inc     cx                      ; no, so go to next FAT sector
+        cmp     cx,cs:[fat_end]         ; are we at the end of the FAT?
+        jb      find_sector_create      ; if not, continue searching
+bad_create:                             ; if we're here, no more space!
+        call    pop_drive
+bad_create_no_pop:
+        stc                             ; carry = 1 = error
+        pop     cx
+        pop     di
+        pop     es                      ; restore all registers
+        POP_A
+        pop     ds
+        ret
+found_sector_create:                    ; found an empty sector at cs:[di-2]
+        dec     di                      ; sub 2. cs/ds:[di]=new sector in FAT
+        dec     di
+        mov     w[di],0ffffh            ; mark new sector as last in chain
+        mov     bx,di                   ; bx = pointer to new sector in FAT
+        call    modify_sector           ; set its modify flag
+        dec     cx                      ; cx = current FAT sector, decrement
+                                        ; it to make is zero based.
+        BITMW   shl,cx,8                ; mul by 256(FAT contains 256 entries)
+        and     di,200h-1               ; mod di by 512
+        shr     di,1                    ; div by 2(make index to FAT entry)
+        add     cx,di                   ; cx = new sector
+        push    cx                      ; save new sector
+
+        mov     ax,[offset find_data+28]; ax = entry in root table
+        push    ax                      ; save entry in root table
+        BITMW   shl,ax,5                ; mul by 32. Each entry = 32 bytes
+        mov     dx,ax                   ; save in dx for indexing
+        BITMW   shr,ax,9                ; divide by 512(get root sector)
+        add     ax,cs:[fat_end]         ; root table start
+        call    read_sector_cache       ; read the root sector
+        call    modify_sector           ; modify it(it will be modified)
+        and     dx,200h-1               ; mod by 512(get offset in sector)
+        add     bx,dx                   ; cs:bx = new root entry
+        mov     di,bx                   ; es/cs:di = new root entry
+        mov     si,offset file_name_exp ; ds:si = the expanded file name
+        mov     cx,20                   ; copy 20 bytes
+        rep     movsb                   ; copy file name to new entry
+        xor     ax,ax
+        stosw
+        stosw                           ; file size = 00000000h
+        pop     bx                      ; bx = entry in root table
+        pop     ax                      ; ax = starting sector
+        stosw                           ; store it in new entry
+        pop     ax                      ; ax = attributes
+        stosw                           ; store them
+
+        lea     si,[di-28]              ; cs/ds:si = start of new entry
+
+        pop     di
+        pop     es                      ; es:di = sft
+        stosb                           ; store attributes
+        xor     ax,ax
+        stosw
+        stosw                           ; file position = 00000000h
+        stosw
+        stosw                           ; file size = 00000000h
+        mov     ax,[si+24]              ; starting physical sector
+        stosw                           ; store is as current physical sector
+        mov     ax,bx                   ; ax = entry in root
+        stosw                           ; store it
+        mov     ax,0ffffh               ; previous physical sector = 0ffffh
+        stosw                           ; no previous physical sector
+        mov     al,cs:[logical_drive]
+        stosb                           ; store drive
+
+        xor     dx,dx
+        call    flush_sectors
+
+        call    pop_drive
+        POP_A
+        pop     ds                      ; restore ds
+        clc
+        ret
+
+;=============================================================================
+
+file_close:                             ; ds:si = sft
+        mov     al,[si+15]
+        call    push_drive
+        xor     dx,dx
+        call    flush_sectors           ; flush all system sectors
+        mov     ax,[si+11]              ; ax = entry in root table
+        mov     di,ax                   ; save it di for indexing
+        BITMW   shr,ax,4                ; ax<-(ax*32)/512)=(ax<<5)>>0)=(ax>>4)
+        add     ax,cs:[fat_end]         ; root table start
+        call    read_sector_cache       ; read the root table sector
+        call    modify_sector           ; this sector will be modified
+        and     di,0fh                  ; mod by 16. 16 entries per root sect.
+        BITMW   shl,di,5                ; mul. by 32. each entry = 32 bytes
+        lea     di,[bx+di+20]           ; lea di,[RootSector.entry.size]
+        add     si,5                    ; ds:si = sft.size
+        cld                             ; go forward
+        lodsw                           ; ax = ds:si = file size low word
+        mov     cs:[di],ax              ; cs:di = ax = file size low word
+        add     di,2
+        lodsw                           ; ax = ds:si = file size high word
+        mov     cs:[di],ax              ; cs:di = ax = file size high word
+        add     di,2
+        mov     dx,1                    ; flush all sectors
+        call    flush_sectors           ; flush all sectors & invalidate them
+        call    pop_drive
+        ret
+
+;=============================================================================
+
+modify_sector:                          ; cs:bx = pointer to DISK BUFFER
+                                        ; will take a disk buffer and set its
+                                        ; modified flag
+        push    bx                      ; save pointer to disk buffer
+        sub     bx,DISK_BUFFERS         ; bx = disk buffer * 512
+        BITMW   shr,bx,9                ; bx = disk buffer index
+        mov     b[cs:bx+buffer_modify],1; set its modify flag
+        pop     bx                      ; restore bx = pointer to disk buffer
+        ret
+
+;=============================================================================
+
+flush_sectors:                          ; dx = 1 = flush all
+                                        ;      0 = flush only system
+                                        ; will invalidate all kernel sectors.
+                                        ; well flush them if they've been
+                                        ; modified.
+        push    ax
+        push    bx
+        push    cx
+        push    si
+        push    ds                      ; save all modified registers
+        push    cs
+        pop     ds                      ; ds = cs
+
+        sub     w[drive_sp],32
+
+        mov     si,26                   ; 26 drives
+next_drive:
+        push    si
+        dec     si                      ; drives are zero based
+        mov     cx,NUM_BUFFS            ; search all of the disk buffers
+flush_loop:
+        push    cx                      ; save current disk buffer
+
+        dec     cx                      ; make it zero based
+        mov     bx,cx                   ; bx = current disk buffer
+        mov     al,[bx+buffer_drives]
+        sub     al,'A'
+        xor     ah,ah
+        cmp     ax,si
+        jne     not_sys
+        shl     bx,1                    ; * by 2(select buffer content)
+        add     bx,offset buffer_content; w[bx] = content for current buffer
+        mov     ax,[root_end]
+        cmp     [bx],ax                 ; is the sector below file sect start
+        jb      sys_sect                ; if so, flush it
+        or      dx,dx                   ; it's a file sect. flush anyway?
+        jz      not_sys                 ; if not, don't flush it
+sys_sect:
+        mov     ax,[bx]                 ; ax = buffer content
+        cmp     b[cs:invalidation],0    ; should we invalidate the sector?
+        je      no_invalidate           ; if not, don't invalidate it
+        mov     ax,-1                   ; ax = ffff = new buffer content
+no_invalidate:
+        xchg    [bx],ax                 ; sect.content = ffff, ax=sect.content
+        mov     bx,cx                   ; bx = current disk buffer
+        cmp     b[bx+buffer_modify],0   ; is it 0 = not modified?
+        je      not_sys                 ; if so, we don't need to flush it
+        mov     b[bx+buffer_modify],0   ; unmodify it, as it will be flushed
+        push    ax
+        mov     al,[bx+buffer_drives]
+        call    change_drive
+        mov     bx,cx                   ; bx = current disk buffer
+        BITMW   shl,bx,9                ; * by 512(select disk buffer)
+        add     bx,DISK_BUFFERS         ; bx = start of target disk buffer
+        pop     ax
+        call    write_sector            ; flush it
+not_sys:
+        pop     cx                      ; restore cx = current disk buffer
+        loop    flush_loop              ; do next buffer
+        pop     si
+        dec     si
+        jnz     next_drive
+
+        add     w[drive_sp],32
+
+        pop     ds
+        pop     si
+        pop     cx
+        pop     bx
+        pop     ax                      ; restore saved registers
+        ret
+
+;=============================================================================
+
+expand_name:                            ; ds:si = source name
+                                        ; es:di = buffer(20 bytes)
+                                        ; ret: carry = 1 if error.  If error,
+                                        ;      buffer will have unpredictable
+                                        ;      contents.
+                                        ; ret: al = drive
+        cld                             ; go forward
+        push    ax
+        push    cx
+        push    si
+        push    di                      ; save ax/cx/si/di
+        push    di
+        cmp     b[si+1],':'
+        jne     no_specify_drive
+        add     si,2
+no_specify_drive:
+        mov     al,20h                  ; al = space
+        mov     cx,20                   ; 20 chars in dest. buffer
+        rep     stosb                   ; fill dest. buffer with spaces
+        pop     di                      ; restore di = beginning of buffer
+        mov     al,[si]
+        or      al,al
+        jnz     not_zero_expand
+        mov     b[es:di],'*'
+        mov     b[es:di+16],'*'
+        jmp     expand_good
+
+not_zero_expand:
+        mov     al,[si]                 ; al = first character of name
+        call    check_name_char         ; is it a valid file name character?
+        jc      bad_name_expand         ; if not, this is a bad file name
+        mov     cx,16                   ; check file name(name = 16 bytes max)
+copy_name_loop:
+        lodsb                           ; get next name byte
+        or      al,al                   ; if it's 0, we're done(no extention)
+        jz      expand_good
+        cmp     al,'.'                  ; if it's a '.', we're done the name
+        je      copy_ext                ; go to the extention
+                                        ; if we're here, it's a file name
+                                        ; character, which must be checked
+        call    check_name_char         ; is it a valid file name character?
+        jc      bad_name_expand         ; if not, it's a bad file name
+        stosb                           ; otherwise store it
+        loop    copy_name_loop
+                                        ; if we're here, the file name is 16+
+                                        ; bytes long.
+        lodsb                           ; get next byte in file name
+        cmp     al,0                    ; is it 0 = no extention?
+        je      expand_good             ; if so, we're done
+        cmp     al,'.'                  ; is it a '.'
+        jne     bad_name_expand         ; if not, it's something else. error.
+                                        ; if we're here, file name is good
+copy_ext:
+        pop     di                      ; restore di = beginning of buffer
+        push    di                      ; save it again
+        add     di,16                   ; di = first char of extention
+        mov     cx,4                    ; extention is max 4 bytes
+copy_ext_loop:
+        lodsb                           ; load next extention byte
+        or      al,al                   ; if it's 0, we're done the ext
+        jz      expand_good
+        call    check_name_char         ; otherwise check it
+        jc      bad_name_expand
+        stosb                           ; store it
+        loop    copy_ext_loop
+                                        ; if we're here, file ext = 4 bytes
+        cmp     b[si],0                 ; is next char 0 like it should be?
+        jne     bad_name_expand         ; if not, error--extention > 4 bytes
+expand_good:
+        clc
+        jmp     done_expand
+bad_name_expand:
+        stc
+        pop     di
+        pop     si
+        pop     cx
+        pop     ax
+        ret
+done_expand:
+        pop     di                      ; di = start of destination buffer
+        pushf                           ; save the flags
+        push    di                      ; save di again
+        mov     cx,20                   ; file name is 20 bytes
+to_upper:
+        mov     al,es:[di]              ; al = next char in file name
+        call    make_upper
+        mov     es:[di],al              ; store it
+        inc     di                      ; next character
+        loop    to_upper
+        pop     di                      ; restore di
+        popf                            ; store flags
+        pop     si
+        pop     cx
+        pop     ax                      ; restore ax/cx/si/di
+
+        pushf
+
+        mov     al,cs:[logical_drive]
+        cmp     b[si+1],':'
+        jne     no_specify_drive2
+        mov     al,[si]
+        call    make_upper
+        call    push_drive
+        jnc     good_specified_drive
+        pop     ax
+        or      al,1
+        push    ax
+        popf
+        ret
+good_specified_drive:        
+        call    pop_drive
+        pop     ax
+        and     al,0feh
+        push    ax
+        mov     al,[si]
+        call    make_upper
+no_specify_drive2:
+        popf
+        ret
+
+;=============================================================================
+
+file_open:                              ; bx = seg of sft
+                                        ; dl = mode = (0/1/2) = (r/w/[r/w])
+                                        ; es:di = ASCIIZ file name
+                                        ; carry = status
+        cld                             ; go forward
+        push    ds
+        push    es
+        push    di                      ; save es:di = pointer to ASCIIZ name
+        push    bx                      ; save seg of sft
+        push    dx                      ; save access mode
+        push    es
+        push    di
+        pop     si
+        pop     ds                      ; copy es:di to ds:si
+        push    cs
+        pop     es                      ; es = cs
+        mov     di,offset find_data     ; es:di = find_data
+        call    expand_name             ; expand and pad the file name
+        jc      error_open_no_pop       ; if carry, name is bad
+        cmp     b[es:di],'*'            ; if first char is '*', it's invalid
+        je      error_open_no_pop
+        call    push_drive
+        mov     w[es:di+26],0ffffh      ; attributes -- all
+        call    find_first_file         ; try to find the file we need
+        jc      error_open              ; if error, file doesn't exist
+        pop     ax                      ; restore access rights
+        pop     es                      ; es = seg of sft
+        push    es                      ; save seg of sft again
+        push    ax                      ; save access rights again
+        inc     al                      ; change to our format. 1/2/3
+        and     al,3                    ; iscolate our bits
+        and     al,b[cs:di+26]          ; and it with file access rights
+        xor     di,di                   ; es:di = sft
+        stosb                           ; save access rights
+        xor     ax,ax                   ; file position = 0
+        stosw
+        stosw
+        mov     ax,cs:[find_data+20]    ; low word of file size
+        stosw
+        mov     ax,cs:[find_data+22]    ; high word of file size
+        stosw
+        mov     ax,cs:[find_data+24]    ; current physical sector
+        stosw
+        mov     ax,cs:[find_data+28]    ; entry in root table
+        stosw
+        mov     ax,-1                   ; previous physical sector -- none
+        stosw
+        mov     al,cs:[logical_drive]
+        stosb                           ; store drive
+        call    pop_drive
+        clc                             ; no error
+        jmp     end_open
+error_open:
+        call    pop_drive
+error_open_no_pop:
+        stc
+end_open:
+        pop     dx
+        pop     bx
+        pop     di
+        pop     es
+        pop     ds
+        ret
+
+;=============================================================================
+
+file_write:                             ; es:bx = sft
+                                        ; cx = # bytes to write
+                                        ; ds:si = bytes to write
+                                        ; returns ax = # bytes written
+        cld                             ; go forward
+        mov     al,es:[bx]              ; get access rights
+        test    al,2                    ; test write access bit
+        jnz     good_file_write         ; is the file writable
+        stc                             ; carry = 1; error
+        xor     ax,ax                   ; ax = 0 = 0 bytes written
+        ret
+good_file_write:
+        xor     dx,dx                   ; flush only system sectors
+        call    flush_sectors           ; flush all system sectors
+        mov     al,es:[bx+15]
+        call    push_drive
+        or      cx,cx                   ; write 0 bytes(truncate)?
+        jnz     no_truncate
+        call    pop_drive
+        stc                             ; no truncation code yet
+        xor     ax,ax                   ; return error on truncate request
+        ret
+
+no_truncate:
+        push    cx                      ; save # of bytes to write
+write_next_byte:
+        cmp     w[es:bx+9],0ffffh       ; is current physical sector = EOF?
+        jne     not_eof_write           ; if not, we're not at the EOF mark
+                                        ; now we must find a new sector
+        push    cx                      ; save # of bytes left to write
+        mov     cx,1                    ; start at first FAT sector
+find_empty_sector:
+        mov     ax,cx                   ; ax = next FAT sector to search
+        push    bx                      ; save sft pointer
+        call    read_sector_cache       ; read next FAT sector
+        mov     di,bx                   ; cs:di = buffer
+        pop     bx                      ; bx = sft
+        push    cx                      ; save current FAT sector
+        mov     cx,200h/2               ; scan 100h words
+        xor     ax,ax                   ; search for 0000h(empty sector)
+        push    es
+        push    cs
+        pop     es
+        repne   scasw                   ; do it
+        pop     es
+        pop     cx                      ; cx = current FAT sector
+        je      found_empty_sector      ; did we find a 0000h(empty sector)
+        inc     cx                      ; no, so go to next FAT sector
+        cmp     cx,cs:[fat_end]         ; are we at the end of the FAT?
+        jb      find_empty_sector       ; if not, continue searching
+        pop     cx                      ; cx = # of bytes left to write
+        jmp     done_file_write         ; if we're here, there is no more
+                                        ; disk space left!
+found_empty_sector:                     ; found an empty sector at cs:[di-2]
+        dec     di                      ; sub 2.  cs:[di] = new sector in FAT
+        dec     di
+        mov     w[cs:di],0ffffh         ; mark new sector as last in chain
+        xchg    bx,di                   ; bx = ptr to fat, di = sft
+        call    modify_sector           ; set its modify flag
+        xchg    bx,di                   ; restore di = ptr to fat, bx = sft
+        dec     cx                      ; cx = current FAT sector, decrement
+                                        ; it to make is zero based.
+        BITMW   shl,cx,8                ; mul by 256(FAT contains 256 entries)
+        and     di,200h-1               ; mod di by 512
+        shr     di,1                    ; div by 2(make index to FAT entry)
+        add     cx,di                   ; cx = new sector
+        push    cx                      ; save new sector
+        mov     ax,es:[bx+13]           ; ax = previous physical sector
+        shl     ax,1                    ; multiply by two(FAT entry = 2 bytes)
+        mov     dx,ax                   ; put it in dx for indexing
+        BITMW   shr,ax,9                ; divide by 512(get FAT sector)
+        and     dx,200h-1               ; mod dx by 512
+        inc     ax                      ; make ax 1 based(1st FAT sector = 1)
+        push    bx                      ; save sft
+        call    read_sector_cache       ; read FAT sector of prev.phys.sect.
+        call    modify_sector           ; set its modify flag
+        mov     di,bx                   ; di = the buffer
+        pop     bx                      ; bx = sft
+        add     di,dx                   ; cs:di = previous physical sector
+        pop     ax                      ; ax = new sector
+        mov     cs:[di],ax              ; link prev.phys sector to new one
+        add     di,2
+        mov     es:[bx+9],ax            ; current physical sector = new one
+        pop     cx                      ; cx = # of bytes left to write
+
+not_eof_write:
+        mov     ax,es:[bx+9]            ; sft.current physical sector
+        push    bx                      ; save sft
+        call    read_sector_cache       ; read in current sector
+        call    modify_sector           ; set its modify flag
+        mov     di,bx                   ; di = buffer of current sector
+        pop     bx                      ; restore bx = sft
+        mov     ax,es:[bx+1]            ; ax = low word of file position
+        and     ax,200h-1               ; mod by 512
+        add     di,ax
+        lodsb                           ; get next byte to be written
+        mov     cs:[di],al              ; store it to disk buffer
+        inc     di
+        add     w[es:bx+1],1            ; add bytes read to file position
+        adc     w[es:bx+3],0
+
+        mov     ax,di                   ; ax = current location in disk buffer
+        and     ax,200h-1               ; mod it by 512(test to see if at end)
+        jnz     no_next_sector_read
+                                        ; find next sector
+        mov     ax,es:[bx+9]            ; sft.current physical sector
+        mov     es:[bx+13],ax           ; sft.previous physical sector
+        shl     ax,1                    ; mul by 2. FAT entries = 2 bytes
+        mov     dx,ax                   ; dx = current physical sector
+        BITMW   shr,ax,9                ; divide by 512(get FAT sector)
+        inc     ax                      ; FAT is 1 based(sector 1)
+        push    bx                      ; save sft
+        call    read_sector_cache       ; read in the FAT sector
+        and     dx,200h-1               ; mod it by 512 for FAT sector
+        add     bx,dx                   ; bx = FAT buffer + index to entry
+        mov     ax,cs:[bx]              ; ax = the next sector to write to
+        pop     bx                      ; restore bx = sft
+        mov     es:[bx+9],ax            ; sft.current physical sector
+no_next_sector_read:
+        dec     cx
+        jz      end_of_write
+        jmp     write_next_byte         ; write next byte
+end_of_write:
+done_file_write:
+        call    pop_drive
+        pop     ax                      ; ax = original # of bytes to write
+        sub     ax,cx                   ; ax-cx->ax. ax = # of bytes written
+        mov     cx,es:[bx+7]
+        mov     dx,es:[bx+5]            ; cx:dx = file size(before write)
+        cmp     cx,es:[bx+3]            ; cmp high words of size and position
+        ja      no_update_size          ; if size > pos, no update needed
+        jb      update_size             ; if size < pos, we must update size
+                                        ; <- at this point, high words are =
+        cmp     dx,es:[bx+1]            ; cmp low words of size and position
+        jae     no_update_size          ; if size >= pos, no update needed
+update_size:                            ; <- at this point, position > size
+        mov     cx,es:[bx+3]
+        mov     dx,es:[bx+1]            ; cx:dx = position
+        mov     es:[bx+7],cx
+        mov     es:[bx+5],dx            ; copy position to size
+no_update_size:
+        clc                             ; clear carry, no error
+        ret
+
+;=============================================================================
+
+file_read:                              ; ds:si = sft
+                                        ; cx = # bytes to read
+                                        ; es:di = place to write bytes to
+                                        ; returns ax = # bytes read
+        cmp     cx,0                    ; are we trying to read 0 bytes?
+        je      bad_file_read           ; can't do that
+        cld                             ; make sure to go forward
+        push    si                      ; save sft
+        lodsb                           ; load access rights
+        test    al,1                    ; test access rights for read(bit 0)
+        jz      bad_file_read           ; if 0, can't read from file
+        lodsw                           ; load low word of file position
+        mov     bx,ax
+        lodsw                           ; load high word of file position
+        mov     dx,ax                   ; dx:bx = file position
+        lodsw                           ; load low word of file size
+        cmp     ax,bx                   ; cmp low words of size and position
+        jne     proceed_in_read         ; if not equal, proceed
+        lodsw                           ; load high word of file size
+        cmp     ax,dx                   ; cmp high words of size and position
+        jne     proceed_in_read         ; if not equal, proceed
+bad_file_read:
+        pop     si                      ; pop off the sft
+        xor     ax,ax                   ; 0 bytes read
+        ret
+proceed_in_read:
+        xor     dx,dx                   ; flush only system sectors
+        call    flush_sectors           ; flush all the system sectors
+        pop     bx                      ; bx = sft.access rights
+        mov     al,[bx+15]
+        call    push_drive
+        push    cx                      ; save # bytes to read
+        inc     cx                      ; add one for initial sector load
+        jmp     not_at_end              ; load the initial_sector
+read_the_file:
+        mov     al,cs:[si]              ; read next byte
+        inc     si
+        stosb                           ; store next byte
+        add     w[bx+1],1               ; add 1 to file position
+        adc     w[bx+3],0
+                                        ; test for new sector
+        mov     ax,si                   ; ax = current position in buffer
+        and     ax,200h-1               ; mod it by 512
+        jnz     not_end_of_sector       ; if not zero, we're not at sector end
+                                        ; load new sector here
+        mov     ax,[bx+9]               ; current sector
+        mov     [bx+13],ax              ; previous physical sector = current
+        shl     ax,1                    ; multiply by 2. fat entries=2 bytes
+        mov     dx,ax                   ; save it in dx
+        BITMW   shr,ax,9                ; div by 512 to get fat sector
+        inc     ax                      ; make it one based
+        push    bx                      ; save sft
+        call    read_sector_cache       ; read fat sector
+        mov     si,bx                   ; si = buffer of fat sector
+        pop     bx                      ; retore bx = sft
+        and     dx,200h-1               ; mod abs fat position by 512
+        add     si,dx                   ; add it to get position in buffer
+        mov     ax,cs:[si]              ; get next sector
+        add     si,2
+        mov     [bx+9],ax               ; store new current physical sector
+not_end_of_sector:
+        mov     ax,[bx+1]
+        mov     dx,[bx+3]               ; dx:ax = file position
+        cmp     ax,[bx+5]               ; cmp low words of position and size
+        jne     not_at_end              ; if not equal, we're not at the end
+        cmp     dx,[bx+7]               ; cmp high words of position and size
+        je      done_read_file          ; if equal, we're done
+not_at_end:
+        mov     ax,[bx+9]               ; ax = current sector
+        push    bx                      ; save sft
+        call    read_sector_cache       ; read current sector
+        mov     si,bx                   ; si = buffer
+        pop     bx                      ; restore sft
+        mov     dx,[bx+1]               ; dx = low word of file position
+        and     dx,200h-1               ; mod low word of position by 200h
+        add     si,dx                   ; si = next byte to read
+        loop    read_the_file           ; next byte; decrement cx
+        inc     cx
+done_read_file:
+        dec     cx
+        call    pop_drive
+        pop     ax                      ; ax = original # bytes to read
+        sub     ax,cx                   ; ax-cx->ax = # bytes read
+        ret
+
+;=============================================================================
+
+resize_mem:                             ; ax = address of mcb to resize
+                                        ; cx = size to resize it to(mcb incl)
+                                        ; ret: bx = max size(mcb incl)
+                                        ; ret: carry = 1 if error, else 0
+        push    es                      ; save es
+        mov     es,ax                   ; es = target mcb segment
+        mov     bx,es:[3]               ; bx = next in chain
+        sub     bx,ax                   ; bx = (bx-ax) = next-prev = max size
+        cmp     bx,cx                   ; is resize # bigger than max?
+        jb      error_resize            ; if so, jump(carry is set).
+        mov     es:[1],cx               ; mcb.size = cx. (carry is not set)
+error_resize:
+        pop     es                      ; restore es
+        ret
+
+;=============================================================================
+
+free_mem:                               ; ax = address of mcb to free
+        push    es                      ; save es
+        mov     dx,FIRST_MCB_SEG        ; dx = segment of first MCB
+        mov     es,dx                   ; es:[0] = first MCB
+find_the_mcb:
+        cmp     es:[3],ax               ; is MCB.next = to target MCB?
+        je      found_the_mcb
+        mov     bx,es:[3]               ; bx = MCB.next in chain
+        mov     es,bx                   ; es = new MCB(next)
+        cmp     bx,0a000h               ; are we at the end of the chain?
+        jne     find_the_mcb
+        jmp     done_free_mem           ; couldn't find the mcb
+found_the_mcb:
+        push    es                      ; push MCB previous to target
+        mov     es,ax                   ; es = target MCB
+        mov     ax,es:[3]               ; ax = target MCB.next
+        pop     es                      ; es = previous MCB
+        mov     es:[3],ax               ; previous MCB.next = target MCB.next
+done_free_mem:
+        pop     es                      ; restore es
+        ret
+
+;=============================================================================
+
+allocate_mem:                           ; # paras in bx, start mcb in ax
+                                        ; cx = psp seg of owner
+                                        ; returns address in ax. 0 if fail
+                                        ; if fail, di = biggest mcb available
+        push    ds
+        push    es
+        inc     bx                      ; take needed mcb into account
+        xor     di,di
+find_gap:
+        mov     es,ax                   ; es = seg of next mcb to test
+        add     ax,es:[1]               ; ax = seg of mcb + length(the end)
+        mov     dx,es:[3]               ; dx = next mcb
+        sub     dx,ax                   ; dx = gap between this block & next
+        cmp     dx,di
+        jb      not_biggest
+        mov     di,dx
+not_biggest:
+        cmp     bx,dx                   ; compare that gap with memory wanted
+        jbe     found_place             ; is the gap enough
+        mov     ax,es:[3]               ; ax = next in chain
+        cmp     ax,0A000h               ; is it A000h?  A000h means the end
+        jne     find_gap                ; continue if it's not the end
+        xor     ax,ax                   ; return ax = 0, error
+        jmp     done_allocate
+found_place:
+        mov     ds,ax                   ; ds = new mcb
+        xchg    es:[3],ax               ; ax <- old mcb.next <- ax=new mcb.
+        mov     [5],cx                  ; psp seg of owner
+        mov     [3],ax                  ; new mcb.next = old mcb.next
+        mov     [1],bx                  ; new mcb.length = bx(mem requested)
+        mov     b[0],0                  ; new mcb.type = 0(program code/data)
+        mov     ax,ds                   ; ax = new mcb
+done_allocate:
+        pop     es
+        pop     ds
+        ret
+
+;=============================================================================
+
+file_seek:                              ; es:di points to sft
+        push    ds                      ; dx:ax = amount to seek
+        push    cs                      ; bx = from where
+        pop     ds                      ; ds = cs
+
+        cmp     bx,1                    ; check if user wants just to get the
+        jne     not_check_pos           ; file position
+        cmp     dx,0
+        jne     not_check_pos
+        cmp     ax,0
+        jne     not_check_pos
+        jmp     done_seek
+not_check_pos:
+
+        or      bx,bx
+        jz      check_position
+        dec     bx
+        jz      from_middle
+                                        ; seek from the end
+        add     dx,es:[di+7]            ; bx+7 = high word of file size
+        add     ax,es:[di+5]            ; bx+5 = low word of file size
+        adc     dx,0
+        jmp     check_position
+from_middle:
+        add     dx,es:[di+3]            ; high word of file position
+        add     ax,es:[di+1]            ; low word of file position
+        adc     dx,0
+check_position:
+        cmp     dx,es:[di+7]            ; cmp desired position with file size
+        jb      seek_sector             ; below? good.
+        ja      bad_seek                ; above? bad.
+        cmp     ax,es:[di+5]            ; at this point, high words are equal
+        ja      bad_seek                ; above? bad.
+seek_sector:
+        push    ax
+        push    dx                      ; save high word of new file position
+        xor     dx,dx                   ; flush only system sectors
+        call    flush_sectors           ; flush all system sectors
+        mov     al,es:[di+15]           ; drive of file
+        call    push_drive
+        pop     dx                      ; restore high word of file position
+        pop     ax
+        mov     es:[di+1],ax            ; store new file position
+        mov     es:[di+3],dx
+        mov     cx,200h
+        div     cx                      ; divide new file position by 512
+        mov     cx,ax                   ; cx = quotient = num sectors to pass
+        mov     ax,es:[di+11]           ; di+11 = entry in root table
+        mov     dx,ax                   ; save it in dx
+        BITMW   shr,ax,4                ; ax = (ax*32)/512
+        add     ax,cs:[fat_end]         ; root table start
+        call    read_sector_cache       ; read root entry sector
+        and     dx,0fh                  ; mod by 16. 16 entries per sector
+        BITMW   shl,dx,5                ; * 32
+        add     bx,dx
+        mov     si,bx                   ; si = file's root entry
+        mov     w[es:di+13],0ffffh      ; previous physical sector = none
+        mov     ax,[si+24]              ; starting sector of file
+        jcxz    loaded_sector           ; if we want file sector 0, we have it
+find_first_sector:
+        mov     es:[di+13],ax           ; previous physical sector
+        shl     ax,1                    ; each entry in FAT = 2 bytes
+        mov     dx,ax                   ; save current sector
+        BITMW   shr,ax,9                ; divide by 512(get sector of fat)
+        inc     ax                      ; start of FAT = sector 1
+        call    read_sector_cache       ; read fat sector
+        and     dx,200h-1               ; mod by 512
+        add     bx,dx                   ; bx = start of fat entry for sector
+        mov     ax,[bx]                 ; get next sector in chain
+        loop    find_first_sector
+loaded_sector:
+        mov     es:[di+9],ax            ; store current sector in SFT
+        call    pop_drive
+        clc
+        jmp     done_seek
+bad_seek:
+        stc
+done_seek:
+        pop     ds
+        ret
+
+;=============================================================================
+
+find_first_file:                        ; will search for a file name with
+                                        ; criteria in the find_data dta
+                                        ; starting with entry 0.
+
+        mov     w[cs:offset find_data+24],0
+        jmp     find_next_file
+
+;=============================================================================
+
+find_next_file:                         ; will search for a file name with
+                                        ; criteria in the find_data dta
+                                        ; starting with entry [find_data+24]
+        push    ds
+        push    es
+        PUSH_A
+        mov     ax,cs
+        mov     ds,ax
+        mov     es,ax                   ; es = ds = cs
+        xor     dx,dx                   ; flush only system sectors
+        call    flush_sectors           ; flush all system sectors
+
+        mov     cx,[offset find_data+24]; start at ROOT entry given
+        mov     ax,cs:[root_end]
+        sub     ax,cs:[fat_end]
+        mov     bx,16
+        mul     bx
+        cmp     cx,ax                   ; if cx < #entries, carry = 1
+        cmc                             ; reverse carry
+        jnc     next_entry
+        jmp     done_find_next          ; if carry set, cx >= 192. bad.
+next_entry:
+        push    cx                      ; save current root entry
+        mov     ax,cx                   ; ax = current root entry
+        BITMW   shr,ax,4                ; ax = (ax*32)/512 = (ax<<5)>>9
+        add     ax,cs:[fat_end]         ; make it based on start of root
+        call    read_sector_cache       ; read root table
+        jnc     good_read_find
+        pop     cx
+        jmp     done_find_next
+good_read_find:
+        mov     si,cx                   ; si = current root entry
+        BITMW   shl,si,5                ; multiply by 32(entry = 32 bytes)
+        and     si,200h-1               ; mod it by 512(get offset in sector)
+        add     si,bx                   ; bx = buffer, si = start of entry
+        mov     di,offset find_data     ; name to search for
+        mov     cx,16                   ; file name = 16 bytes
+        cld
+        repe    cmpsb                   ; compare file name with given name
+        je      good_name
+        add     di,cx                   ; di = start of extension
+        add     si,cx                   ; si = start of extension
+        cmp     b[si-16],20h            ; does this entry contain a file name?
+        je      bad_name                ; if not, skip it
+        cmp     b[di-16],'*'            ; is first char of name a wild card?
+        jne     bad_name                ; if not, this is not a match
+good_name:
+        mov     cx,4                    ; extension = 4 bytes
+        repe    cmpsb                   ; compare extension with given
+        je      good_ext
+        add     di,cx                   ; di = file size
+        add     si,cx                   ; si = file size
+        cmp     b[di-4],'*'             ; is first char of ext a wild card?
+        jne     bad_name
+good_ext:
+        cmp     b[si-20],20h            ; if name = blank, don't apply mask
+        je      found_next
+        mov     ax,[di+6]               ; attribute mask
+        mov     bx,[si+6]               ; attribute
+        and     bx,ax                   ; apply mask to attributes
+        jnz     found_next
+bad_name:
+        pop     cx                      ; cx = current entry in root table
+        inc     cx                      ; go to next sector
+        mov     ax,cs:[root_end]
+        sub     ax,cs:[fat_end]
+        mov     bx,16
+        mul     bx
+        cmp     cx,ax                   ; are we at the end of the root table?
+        jb      next_entry              ; if not, continue
+        stc                             ; return error(carry = 1)
+        jmp     done_find_next          ; couldn't find it
+found_next:
+        sub     di,20                   ; di = beginning of entry
+        sub     si,20                   ; si = beginning of entry
+        mov     cx,28                   ; 32 bytes-last 4 bytes
+        rep     movsb                   ; copy entry to dta
+        pop     ax                      ; ax = current entry in root table
+        stosw                           ; store it in dta
+        clc                             ; no error(carry = 0)
+done_find_next:
+        POP_A
+        pop     es
+        pop     ds
+        ret
+
+;=============================================================================
+
+set_drive:                              ; will set the drive pointed to by
+                                        ; [drive_sp]
+        push    ds
+        push    es
+        push    cs
+        pop     ds
+        push    cs
+        pop     es
+        mov     di,offset disk_parameters
+        mov     si,[drive_sp]
+        mov     cx,16/2
+        cld
+        rep     movsw
+        pop     es
+        pop     ds
+        ret
+
+;=============================================================================
+
+make_upper:                             ; will make a drive uppercase in AL
+        cmp     al,'a'
+        jb      not_lower
+        cmp     al,'z'
+        ja      not_lower
+        sub     al,32
+not_lower:
+        ret
+
+;=============================================================================
+
+flush_drive_cache:                      ; will flush the drive cache
+        push    es
+        PUSH_A
+        push    cs
+        pop     es
+        mov     di,offset drive_cache
+        mov     cx,(4*32)/2
+        xor     ax,ax
+        cld
+        rep     stosw
+        POP_A
+        pop     es
+        ret
+
+;=============================================================================
+
+find_drive:                             ; will search for a drive and get its
+                                        ; parameters
+                                        ; al = logical drive(A,B,C,D)
+        PUSH_A
+        call    make_upper
+        call    drive_lp
+        jc      bad_find_drive
+        cmp     b[cs:drive_caching],0
+        je      good_find_drive
+        push    ds
+        push    es
+        push    cs
+        pop     ds
+        push    cs
+        pop     es
+        mov     di,offset drive_cache-32
+see_if_already_cached:
+        add     di,32
+        cmp     [di+1],al
+        je      already_cached
+        cmp     di,offset drive_cache+(32*3)
+        jne     see_if_already_cached
+
+        mov     di,[next_drv_cache]
+        inc     w[next_drv_cache]
+        and     w[next_drv_cache],3
+        BITMW   shl,di,5
+        add     di,offset drive_cache
+
+already_cached:
+        mov     si,offset temp_drive
+        mov     cx,32/2
+        cld
+        rep     movsw
+        pop     es
+        pop     ds
+good_find_drive:
+        clc
+        jmp     done_find_drive
+bad_find_drive:
+        stc
+done_find_drive:
+        POP_A
+        ret
+
+;=============================================================================
+
+change_drive:                           ; al = logical drive(A,B,C,D)
+                                        ; carry = status
+        PUSH_A
+        call    make_upper
+
+        cmp     b[cs:drive_caching],0
+        je      reload_drive
+
+check_drive_cache:
+        mov     cx,4
+next_drive_cache:
+        push    cx
+        mov     bx,cx
+        dec     bx
+        BITMW   shl,bx,5
+        add     bx,offset drive_cache
+        cmp     cs:[bx+1],al
+        pop     cx
+        je      found_drive
+        loop    next_drive_cache
+
+        call    find_drive
+        jc      bad_change_drive
+        jmp     check_drive_cache
+
+reload_drive:
+        call    find_drive
+        jc      bad_change_drive
+        mov     bx,offset temp_drive
+
+found_drive:
+        push    ds
+        push    es
+        push    cs
+        pop     ds
+        push    cs
+        pop     es
+        mov     si,bx
+        mov     di,[drive_sp]
+        mov     cx,32/2
+        cld
+        rep     movsw
+        call    set_drive
+        pop     es
+        pop     ds
+        clc
+        jmp     done_change_drive
+bad_change_drive:
+        stc
+done_change_drive:
+        POP_A
+        ret
+
+;=============================================================================
+
+push_drive:                             ; al = logical drive(A,B,C,D)
+                                        ; carry = status
+                                        ; will push a drive and set it
+        call    make_upper
+        push    ds
+        push    es
+        push    cs
+        push    cs
+        pop     ds
+        pop     es
+        PUSH_A
+        sub     w[drive_sp],32
+        call    change_drive
+        jnc     done_push
+        add     w[drive_sp],32
+        stc
+done_push:
+        POP_A
+        pop     es
+        pop     ds
+        ret
+
+;=============================================================================
+
+pop_drive:                              ; will pop a drive offset the drive
+                                        ; stack and set it
+        push    ds
+        push    es
+        PUSH_A
+        push    cs
+        pop     ds
+        push    cs
+        pop     es
+        mov     di,cs:[drive_sp]
+        xor     ax,ax
+        mov     cx,32/2
+        cld
+        rep     stosw
+        add     w[cs:drive_sp],32
+        mov     di,cs:[drive_sp]
+        cmp     b[di],0ffh
+        jne     not_invalidated
+        mov     al,[di+1]
+        call    change_drive
+        jmp     done_pop
+not_invalidated:
+        call    set_drive
+done_pop:
+        POP_A
+        pop     es
+        pop     ds
+        ret
+
+;=============================================================================
+
+drive_lp:                               ; al = logical drive(A,B,C,D)
+                                        ; will convert a logical drive into
+                                        ; a physical drive.
+                                        ; if success, temp_drive will be
+                                        ; filled out with drive parameters.
+                                        ; carry = status
+        PUSH_A
+        push    ds
+        push    es
+        push    cs
+        pop     es
+        push    cs
+        pop     ds                      ; ds = es = cs
+        call    make_upper              ; make drive letter uppercase
+        mov     [temp_drive+1],al       ; store it in the temp logical drive
+        sub     al,'A'                  ; make it zero based
+        cmp     al,1                    ; is it <= 1 (floppy)?
+        jbe     floppy_drive
+        mov     al,80h                  ; 80h = hard disk
+floppy_drive:
+        mov     [temp_drive],al         ; store physical drive
+        push    es                      ; save es
+        mov     ah,8                    ; get disk info
+        mov     dl,al                   ; dl = drive
+        int     13h
+        pop     es                      ; restore es
+        jnc     drive_exists
+        jmp     no_drive                ; if carry, this drive doesn't exist
+drive_exists:
+        and     cx,63                   ; iscolate the sectors
+        mov     [temp_drive+2],cl       ; store # of sectors per track
+        inc     dh                      ; get actual number of heads
+        mov     [temp_drive+3],dh       ; store that
+        test    b[temp_drive],80h       ; is this a hard drive?
+        jz      lba_boot_zero           ; if so, the LBA of boot will be zero
+        mov     ax,201h                 ; read 1 sector
+        mov     cx,1                    ; cylinder 0, sector 1
+        mov     dl,[temp_drive]         ; dl = physical drive
+        xor     dh,dh                   ; head 0
+        mov     bx,SCRATCH_BUFFERS      ; es:bx = scratch buffers
+        call    int13_check_error       ; do it
+        mov     w[current_part],-1      ; initialize current partition
+part_loop:
+        inc     w[current_part]         ; get next partition
+        mov     si,[current_part]       ; si = current partition
+        cmp     si,4                    ; is si = 4 = finished partitions?
+        je      no_drive                ; if so, we can't find this drive
+        BITMW   shl,si,4                ; mul by 16(each partition entry = 16)
+        add     si,SCRATCH_BUFFERS+1beh ; part's start at buffer+1beh
+        cmp     b[si+4],0dah            ; does it have the DS-OS signature?
+        jne     part_loop               ; if not, this is not a DS-OS part.
+        inc     si                      ; si = head of boot sector
+        lodsb                           ; get it
+        mov     dh,al                   ; store it
+        lodsw                           ; ax = cylinder/sector of boot sector
+        mov     cx,ax                   ; store it
+        mov     ax,201h                 ; read 1 sector
+        mov     bx,SCRATCH_BUFFERS+200h ; read in boot sector
+        mov     dl,[temp_drive]         ; dl = physical drive
+        call    int13_check_error       ; read boot sector
+        mov     si,SCRATCH_BUFFERS+200h+4
+        mov     al,[temp_drive+1]       ; al = logical drive
+        cmp     al,[si-1]               ; cmp it with the one in the boot
+        je      drive_ok                ; if equal, we found the drive
+        jmp     part_loop               ; if not, try the next partition
+lba_boot_zero:
+        mov     ax,201h                 ; read one sector
+        mov     bx,SCRATCH_BUFFERS
+        mov     cx,1                    ; cylinder 0, sector 1
+        xor     dh,dh                   ; head 0
+        mov     dl,[temp_drive]         ; dl = physical drive
+        call    int13_check_error
+        jc      no_drive
+        mov     si,SCRATCH_BUFFERS+4
+drive_ok:
+        mov     di,offset temp_drive+2  ; copy disk parameters here
+        mov     cx,10                   ; copy 10 bytes
+        rep     movsb
+        clc
+        jmp     good_drive
+no_drive:
+        stc
+good_drive:
+        pop     es
+        pop     ds
+        POP_A
+        ret
+
+;=============================================================================
+
+read_sector_cache:
+        push    ds
+        push    es
+        mov     bx,cs
+        mov     ds,bx
+        mov     es,bx                   ; ds = es = cs = 80h
+        push    cx
+        push    dx
+        push    si
+        push    di
+        mov     cx,NUM_BUFFS
+is_loaded_cache:
+        mov     si,cx
+        dec     si                      ; make disk buffers 0 based
+        mov     bx,si
+        mov     di,si                   ; drive
+        BITMW   shl,bx,9                ; multiply by 512(select disk buffer)
+        add     bx,DISK_BUFFERS
+        shl     si,1                    ; multiply by 2(select disk content)
+        add     si,offset buffer_content
+        cmp     ax,[si]                 ; is wanted sector already loaded?
+        jne     not_this_one
+        add     di,offset buffer_drives
+        mov     dl,[logical_drive]
+        cmp     dl,[di]
+        je      no_need_to_read
+not_this_one:
+        loop    is_loaded_cache         ; try next buffer
+        call    read_sector             ; read it directly
+no_need_to_read:
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     es
+        pop     ds
+        ret
+
+;=============================================================================
+
+read_sector:
+        push    ds
+        push    es
+        mov     bx,cs
+        mov     ds,bx
+        mov     es,bx                   ; ds = es = cs = 80h
+        push    cx
+        push    dx
+        push    si
+        push    di
+        mov     cx,NUM_BUFFS
+is_loaded:
+        mov     si,cx
+        dec     si                      ; make disk buffers 0 based
+        mov     bx,si                   ; buffer index
+        mov     di,si                   ; drive
+        shl     si,1                    ; multiply by 2(select disk content)
+        add     si,offset buffer_content
+        cmp     ax,[si]                 ; is wanted sector already loaded?
+        jne     not_here                ; if so, load new one over that space
+        add     di,offset buffer_drives
+        mov     dl,[logical_drive]
+        cmp     dl,[di]
+        je      read_it
+not_here:
+        loop    is_loaded               ; try next buffer
+        
+        mov     bx,[current_buffer]
+        inc     w[current_buffer]       ; advance to next disk buffer
+        and     w[current_buffer],NUM_BUFFS-1 ; rap it around
+
+        cmp     b[bx+buffer_modify],0
+        je      read_it
+        push    ax
+        push    bx
+        mov     al,[bx+buffer_drives]
+        call    push_drive
+        shl     bx,1
+        mov     ax,[bx+buffer_content]
+        BITMW   shl,bx,8
+        add     bx,DISK_BUFFERS
+        call    write_sector
+        call    pop_drive
+        pop     bx
+        pop     ax
+
+read_it:
+        mov     dl,[logical_drive]
+        mov     b[bx+buffer_drives],dl
+        mov     b[bx+buffer_modify],0
+        shl     bx,1                    ; multiply by two(select buf. content)
+        mov     w[bx+buffer_content],ax
+        BITMW   shl,bx,8                ; multiply by 256. net = *512
+        add     bx,DISK_BUFFERS
+        call    load_sector             ; load the new one
+
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     es
+        pop     ds
+        ret
+
+;=============================================================================
+
+write_sector:
+        push    es
+        push    cs
+        pop     es                      ; es = cs. make sure data always goes
+        call    store_sector            ; in code segment
+        pop     es
+        ret
+
+;=============================================================================
+
+store_sector:                           ; ax = LBA
+        PUSH_A
+        push    bx                      ; save buffer pointer
+        xor     dx,dx
+        add     ax,cs:[boot_lba]        ; base it on the base of the partition
+        adc     dx,cs:[boot_lba+2]
+        call    lba_to_chs
+        call    make_int_13
+        pop     bx                      ; restore buffer pointer
+        mov     ah,3                    ; function 2
+        mov     al,1                    ; read 1 sector
+        call    int13_check_error
+        POP_A
+        ret
+
+;=============================================================================
+
+load_sector:                            ; ax = LBA
+        PUSH_A
+        push    bx                      ; save buffer pointer
+        xor     dx,dx
+        add     ax,cs:[boot_lba]        ; base it on the base of the partition
+        adc     dx,cs:[boot_lba+2]
+        call    lba_to_chs
+        call    make_int_13
+        pop     bx                      ; restore buffer pointer
+        mov     ah,2                    ; function 2
+        mov     al,1                    ; read 1 sector
+        call    int13_check_error
+        POP_A
+        ret
+
+;=============================================================================
+
+; Sector   = (LBA mod SPT)+1
+; Head     = (LBA  /  SPT) mod Heads
+; Cylinder = (LBA  /  SPT)  /  Heads
+
+lba_to_chs:                             ; dx:ax = LBA
+        mov     di,w[cs:sectors]        ; sectors per track
+        and     di,0ffh
+        call    div32_16
+        lea     bp,[si+1]
+        mov     dx,cx
+        mov     ax,bx
+        mov     di,w[cs:heads]          ; heads per cylinder
+        and     di,0ffh
+        call    div32_16
+        mov     cx,si
+        mov     ax,bx                   ; ax = cylinder
+        mov     dx,bp                   ; cx = head
+        ret                             ; dx = sector
+
+;=============================================================================
+
+make_int_13:                            ; (ax/cx/dx) = chs
+        mov     bx,dx                   ; bx = sectors
+        mov     dh,cl                   ; dh = head number
+        mov     dl,cs:[physical_drive]  ; dl = drive
+        mov     ch,al                   ; ch = lower 8 bits of cylinder
+        mov     cl,ah                   ; cl = upper 2 bits of cylinder, 5 bit sector
+        ror     cl,1
+        ror     cl,1
+        add     cl,bl                   ; add in sector
+        ret
+
+;=============================================================================
+
+int13_check_error:
+        PUSH_A
+        push    es
+        mov     di,5                    ; try 3 times
+check_loop:
+        push    di
+        push    ax
+        int     13h
+        jnc     int13_no_error
+        xor     ah,ah
+        int     13h
+        pop     ax
+        pop     di
+        dec     di
+        jnz     check_loop
+        stc
+        jmp     int13_error
+int13_no_error:
+        pop     ax
+        pop     di
+int13_error:
+        pop     es
+        POP_A
+        ret
+
+;=============================================================================
+
+div32_32:                               ; cx:bx = dx:ax / cx:bx, dx:ax = rem
+        push    bp
+        push    di
+        push    si
+
+        mov     bp,32
+        xchg    dx,di
+        xchg    ax,si
+        xor     dx,dx
+        xor     ax,ax
+
+shift_in_loop:
+        clc
+        rcl     si,1
+        rcl     di,1
+        rcl     ax,1
+        rcl     dx,1
+        cmp     dx,cx
+        jb      div32_32_next_bit
+        ja      div32_32_subtract
+        cmp     ax,bx
+        jb      div32_32_next_bit
+div32_32_subtract:
+        sub     ax,bx
+        sbb     dx,cx
+        inc     si
+div32_32_next_bit:
+        dec     bp
+        jnz     shift_in_loop
+
+        mov     cx,di
+        mov     bx,si
+
+        clc
+        jmp     done_div32_32
+div32_32_by_zero:
+        stc
+done_div32_32:
+        pop     si
+        pop     di
+        pop     bp
+        ret
+
+;=============================================================================
+
+div32_16:                               ; Instead of calling this function
+                                        ; directly, use the macros.
+                                        ; cx:bx = dx:ax / di, si = remainder
+                                        ; no overflow
+        push    ax
+        push    dx
+        push    di
+
+        xor     bl,bl
+        push    ax
+        xchg    dx,ax
+        xor     dx,dx
+        div     di
+        mov     cx,ax
+        pop     ax
+        push    ax
+        mov     al,ah
+        mov     ah,dl
+        mov     dl,dh
+        xor     dh,dh
+        div     di
+        mov     bh,al
+        add     cl,ah
+        adc     ch,0
+        pop     ax
+        xor     ah,ah
+        mov     ah,dl
+        mov     dl,dh
+        xor     dh,dh
+        div     di
+        add     bx,ax
+        adc     cx,0
+        mov     si,dx
+
+        pop     di
+        pop     dx
+        pop     ax
+        ret
+
+;=Kernel Data=================================================================
+        
+                        db 200h dup(0)
+        kernel_stack:
+
+        process_table   dw offset open_file       ; 00h
+                        dw offset create_file     ; 01h
+                        dw offset delete_file     ; 02h
+                        dw offset find_first      ; 03h
+                        dw offset find_next       ; 04h
+                        dw offset load_prog       ; 05h
+                        dw offset end_program     ; 06h
+                        dw offset close_file      ; 07h
+                        dw offset read_file       ; 08h
+                        dw offset write_file      ; 09h
+                        dw offset seek_file       ; 0Ah
+                        dw offset mem_allocate    ; 0Bh
+                        dw offset mem_free        ; 0Ch
+                        dw offset mem_resize      ; 0Dh
+                        dw offset get_dta         ; 0Eh
+                        dw offset set_dta         ; 0Fh
+                        dw offset print_string    ; 10h
+                        dw offset get_string      ; 11h
+                        dw offset print_character ; 12h
+                        dw offset get_character   ; 13h
+                        dw offset name_expand     ; 14h
+                        dw offset drive_change    ; 15h
+                        dw offset get_drive       ; 16h
+                        dw offset get_version     ; 17h
+                        dw offset set_invalidation; 18h
+                        dw offset set_drv_caching ; 19h
+                        dw offset bin_to_ascii    ; 1Ah
+                        dw offset name_crunch     ; 1Bh
+                        dw offset rename_file     ; 1Ch
+
+        character_table db '................................'
+                        db '.!..$.&.()*..-..0123456789......'
+                        db '@ABCDEFGHIJKLMNOPQRSTUVWXYZ[.]._'
+                        db '.abcdefghijklmnopqrstuvwxyz{.}..'
+                        db '€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ'
+                        db ' ¡¢£¤¥..¨....­..................'
+                        db '................................'
+                        db '................................'
+
+        cmd_struc       dw offset cmd_name,80h,offset cmd_name,80h,12,82h
+                        dw offset load_cmd,80h,offset kernel_stack,80h
+                        dw 1,0,0,0,0,0
+
+        cmd_name        db 'COMMAND.PGRM',0
+        cmd_no_find     db 13,10,'Error loading COMMAND.PGRM',0
+
+        dta_address     dw 0,0
+        
+        current_psp     dw 81h
+              
+        current_buffer  dw 0
+
+        buffer_modify   db NUM_BUFFS dup(0)
+        buffer_content  dw NUM_BUFFS dup(0)
+        buffer_drives   db NUM_BUFFS dup(0)
+
+        invalidation    db 1
+        drive_caching   db 0
+
+        align           16
+
+        os_sft:         db 0            ; access rights
+                        dd 0,0          ; file position, current file size
+                        dw 0            ; current physical sector(FFFF = EOF)
+                        dw 0,0          ; root entry,prev. phys. sec.
+                        db 0            ; drive(logical)
+
+        find_data       db 32 dup(0)
+        file_name_exp   db 20 dup(0)
+
+        load_struct     dw 0,0          ; seg:off of ASCIIZ file name
+                        dw 0,0          ; seg:off of ASCIIZ command line
+                        dw 0            ; size of cmd line(size<=255)
+                        dw 0            ; psp seg of parent
+                        dw 0,0          ; cs:ip to go to when program is done
+                        dw 0,0          ; ss:sp to use when program is done
+                        dw 0            ; flags: bit 0   = run?
+                                        ;        bit 1-7 = unused
+                        dw 0            ; unused
+                        dd 0,0          ; unused
+
+        temp_drive      db 0            ; physical drive of boot drive
+                        db 0            ; logical drive of boot drive
+                        db 0            ; # of sectors per track
+                        db 0            ; # of heads
+                        dw 0,0          ; lba address of boot sector
+                        dw 0            ; end of fat(relative to base)
+                        dw 0            ; end of root(relative to base)
+
+        current_part    dw 0
+
+disk_parameters:
+
+        physical_drive  db 0            ; physical drive of current log. drive
+        logical_drive   db 0            ; current logical drive
+        sectors         db 0            ; # of sectors per track
+        heads           db 0            ; # of heads
+        boot_lba        dw 0,0          ; lba address of boot sector
+        fat_end         dw 0            ; end of fat(relative to base)
+        root_end        dw 0            ; end of root(relative to base)
+        unused          dd 0
+
+                        db 16*32 dup(0)
+        drive_stack:
+
+        drive_cache     db 4*32 dup(0)
+
+        drive_sp        dw offset drive_stack
+
+        next_drv_cache  dw 0
+
+
+SCRATCH_BUFFERS         = ((($+511)/512)*512)
+DISK_BUFFERS            = (SCRATCH_BUFFERS+400h)
+END_KERNEL              = (DISK_BUFFERS+(NUM_BUFFS*200h))
+
+end

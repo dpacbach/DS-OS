@@ -1,0 +1,279 @@
+<html>
+<head>
+   <title>DS-OS Technical Information</title>
+</head>
+<body text="#000000" bgcolor="#FFFFFF" link="#AA0000" vlink="#AA0000" alink="#AA0000">
+
+<center><font face="Verdana"><font size=+2>The DS-OS File System</font></font></center>
+<font face="Verdana"></font>
+<p><br><font face="Verdana"></font>
+<p><font face="Verdana">This page will describe the format of the DS-OS
+file system.&nbsp; If you would like to know how to create a floppy disk
+image yourself, then you should read this.&nbsp; Currently there is no
+image creation program, so if you want to reassemble DS-OS and create your
+own image, you'll have to create the image by hand.</font>
+<p><b><u><font face="Verdana">How to assemble DS-OS</font></u></b>
+<p><font face="Verdana">First of all, you must use the A86 assembler.&nbsp;
+You could convert it to TASM if you had too much time on your hands, but
+there is no need to.&nbsp; Just do this:</font>
+<p><tt>a86 boot.a86</tt>
+<br><tt>a86 cmd.a86</tt>
+<br><tt>a86 os.a86</tt>
+<p><font face="Verdana">They should all assemble into *.bin files.&nbsp;
+After you've made changes to the source code and reassembled it, you must
+create an empty DS-OS image on a floppy disk.&nbsp; An empty image is a
+new image with no files on it.&nbsp; Then you much put the files onto the
+disk manually.&nbsp; It's not as hard as it seems.&nbsp; We'll take it
+step by step.</font>
+<p><b><u><font face="Verdana">Some things to know first</font></u></b>
+<p><font face="Verdana">First understand that DS-OS does not use clusters.&nbsp;
+It uses sectors.&nbsp; Each sector must be 512 bytes.&nbsp; If they're
+not, DS-OS can't run on that particular disk.&nbsp; However, as long as
+the sector size is 512 bytes, DS-OS will run off of it.&nbsp; That means
+that it will run off of the old floppy disks too.&nbsp; Also, DS-OS uses
+LBA addresses to address sectors.&nbsp; An LBA address is simply a linear
+address(starting at 0) that is used to access sectors.&nbsp; When it is
+ready to access a certain sector, it translates the LBA address to the
+hard disk's native CHS address using the following formulas:</font>
+<p><tt>sector&nbsp;&nbsp; = (LBA mod SPT) + 1</tt>
+<br><tt>head&nbsp;&nbsp;&nbsp;&nbsp; = (LBA&nbsp; /&nbsp; SPT) mod heads</tt>
+<br><tt>cylinder = (LBA&nbsp; /&nbsp; SPT)&nbsp; /&nbsp; heads</tt>
+<p><font face="Verdana">The <i>LBA</i> is the LBA address to be converted
+into CHS.&nbsp; The <i>SPT</i> is the number of sectors per track.&nbsp;
+The <i>heads</i> is the number of heads on the disk.&nbsp; Using LBA addresses
+greatly simplifies disk driver code.&nbsp; From now on when I refer to
+LBA addresses, you'll know what I mean.&nbsp; Play around with these formulas
+by putting in different values in for the LBA variable and see what the
+results are.</font>
+<p><b><u><font face="Verdana">Creating an empty DS-OS IMAGE</font></u></b>
+<p><font face="Verdana">Before you start creating an image, you have to
+understand how a DS-OS formatted floppy disk is layed out.&nbsp; Here's
+how:</font>
+<br>&nbsp;
+<table BORDER COLS=1 WIDTH="20%" HEIGHT="30%" >
+<tr ALIGN=CENTER VALIGN=TOP>
+<td ALIGN=CENTER>Boot sector</td>
+</tr>
+
+<tr ALIGN=CENTER>
+<td ALIGN=CENTER>FAT</td>
+</tr>
+
+<tr ALIGN=CENTER>
+<td ALIGN=CENTER>Root Table</td>
+</tr>
+
+<tr ALIGN=CENTER VALIGN=TOP>
+<td ALIGN=CENTER VALIGN=TOP HEIGHT="100%">File data
+<br>File data
+<br>File data
+<br>File data
+<br>....
+<br>....
+<br>File data
+<br>File data
+<br>File data</td>
+</tr>
+</table>
+
+<p><font face="Verdana">Note that DS-OS <b>can</b> run off of a hard disk.&nbsp;
+But I'll be writing instructions for that later on.&nbsp; For now let's
+just stick to floppy disks which have the above format.</font>
+<p><font face="Verdana">How big are each of those sections?&nbsp; Well,
+the size of the boot sector is 1 sector.&nbsp; The size of the file data
+section is whatever is left over after the boot sector, FAT, and Root Table.&nbsp;
+So the question is, how big are the FAT and Root table?&nbsp; The answer
+is they can be any size.&nbsp; DS-OS was designed to run off of any size
+disk.&nbsp; Therefore, the size of the FAT and Root Table can change to
+accomodate different sized disks which would have smaller FATs.&nbsp; Where
+are the size of the FAT and Root table stored?</font>
+<p><b><u><font face="Verdana">The disk parameter table</font></u></b>
+<p><font face="Verdana">In the boot sector of a DS-OS formatted floppy
+disk, there exists a data structure in a fixed location that holds the
+parameters and attributes of that particular disk.&nbsp; The structure
+starts at offset 2 from the beginning of the boot sector.&nbsp; It is 12
+bytes long, and has the following format:</font>
+<p><tt>reserved&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; db 0&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+; reserved for OS.SYS</tt>
+<br><tt>logical_drive&nbsp;&nbsp; db 0&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+; logical drive of boot drive(HD only)</tt>
+<br><tt>sectors&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; db 18&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+; # of sectors per track</tt>
+<br><tt>heads&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+db 2&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; ; # of heads</tt>
+<br><tt>boot_lba&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; dw 0,0&nbsp;&nbsp;&nbsp;&nbsp;
+; lba address of boot sector</tt>
+<br><tt>fat_end&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; dw 13&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+; end of fat(relative to base)</tt>
+<br><tt>root_end&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; dw 21&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+; end of root(relative to base)</tt>
+<p><font face="Verdana">The values that are set in these fields are the
+values that are used for a 3.5 in. floppy disk.&nbsp; However, they can
+be changed.&nbsp; These are just the values that I thought would be best
+for a 3.5 in. floppy disk.&nbsp; Here is a description of each field:</font>
+<p><font face="Verdana">The <i>reserved</i> byte is reserved for the operating
+system kernel.</font>
+<p><font face="Verdana">The <i>logical_drive</i> byte is used only with
+hard disks.&nbsp; It contains the logical drive letter(C-Z) which represents
+the partition on which it is located.&nbsp; When the user attempts to switch
+to a logical drive letter of C-Z, the operating system will scan each partition
+on the first hard disk.&nbsp; If it finds a partition to be of the DS-OS
+operating system, it will load the partition's boot sector and retrieve
+the logical drive that represents that partition to see if it is the one
+the user(or a program) is requesting.&nbsp; But more on hard disks later.&nbsp;
+Just know that this field should be set to zero when dealing with floppy
+disks.</font>
+<p><font face="Verdana">The <i>sectors</i> field contains the number of
+sectors per track on the floppy disk on which it resides.&nbsp; When formatting
+a disk for DS-OS, the formatting program(not completed yet) calculates
+this value and stores it here.</font>
+<p><font face="Verdana">The <i>heads </i>field contains the number of heads
+present on the floppy disk on which it resides.</font>
+<p><font face="Verdana">The <i>boot_lba</i> field is the LBA address from
+the beginning of the disk at which the boot sector is stored.&nbsp; This
+value is always zero in floppy disks, because the boot sector is always
+the first sector on the disk disk(LBA 0).&nbsp; On hard disks, however,
+the boot sector is not the first sector on the disk.&nbsp; Therefore, the
+kernel uses this field as a base from which to access all of the other
+sections of the file system.</font>
+<p><font face="Verdana">The <i>fat_end</i> is an LBA address relative to
+the <b>boot sector</b> that marks two things:&nbsp; the end of the FAT,
+and the beginning of the root table.&nbsp; The root table always comes
+immediately after the end of the FAT.&nbsp; Therefore, this one field tells
+us the start of the root table, and allows us to calculate the size of
+the FAT.&nbsp; To calculate the size of the fat from this field, just take
+it and subtract one.&nbsp; You must subtract one in order to remove the
+boot sector.&nbsp; That will give you the size of the FAT in sectors.&nbsp;
+More on the FAT later.</font>
+<p><font face="Verdana">The <i>root_end</i> is an LBA address relative
+to the <b>boot sector</b> that marks the end of the the root table and
+the beginning of the file data.&nbsp; To find the size of the root table,
+just subtract the <i>fat_end</i> field from this field like so:</font>
+<p><tt>root_size = (root_end-fat_end)</tt>
+<p><font face="Verdana">In a floppy disk(with my configuration), <i>root_end</i>
+= 21, <i>fat_end</i> = 13, so it looks something like this:</font><font face="Verdana"></font>
+<p><tt>root_size = (&nbsp;&nbsp; 21&nbsp;&nbsp; -&nbsp;&nbsp; 13&nbsp;
+)&nbsp; =&nbsp; 8 sectors</tt><tt></tt>
+<p><font face="Verdana">Note that the <i>fat_end</i> and <i>root_end</i>
+point to the <b>sector after the last sector</b>.&nbsp; They do not point
+<b>to</b> the last sector.</font><b><font face="Verdana"></font></b>
+<p><font face="Verdana"><b>Note: </b>DS-OS does not support subdirectories.&nbsp;
+Therefore it has only one root table in which to keep files.&nbsp; The
+start of the root table can be found in the <i>fat_end</i> field and the
+size can be found by subtracting (<i>root_end-fat_end)</i>.&nbsp; These
+entries are in the disk parameter block as discussed above.</font><font face="Verdana"></font>
+<p><font face="Verdana">All sectors after the end of the root table are
+file sectors.</font><font face="Verdana"></font>
+<p><b><u><font face="Verdana">The File Allocation Table(FAT)</font></u></b><b><u><font face="Verdana"></font></u></b>
+<p><font face="Verdana">The file allocation table(FAT) is very simple.&nbsp;
+With the floppy disk configuration that I provided above, the FAT is 12
+sectors.&nbsp; Each sector contains 256 WORDS.&nbsp; Each WORD represents
+one file data sector.&nbsp; Therefore, the FAT represents 12*256=3072 sectors
+of disk space.&nbsp; We multiply that by 512 bytes per sector to get 1572864
+bytes which is a little over 1.4 megs that the 3.5 in. high density floppy
+disk holds.&nbsp; Here are the values that each WORD in the FAT can hold:</font><font face="Verdana"></font>
+<p><tt>0000h&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; *Free sector; available
+for use</tt>
+<br><tt>0001h&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; *Unavailable or
+Bad</tt>
+<br><tt>0002h-FFFEh&nbsp; *Used sector.&nbsp; The specific number contained
+here</tt>
+<br><tt>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+not only marks the sector as being used, but also</tt>
+<br><tt>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+points to the next sector in the file's chain.</tt>
+<br><tt>FFFFh&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; *The end of a chain/file</tt><tt></tt>
+<p><font face="Verdana">If you've downloaded the image.bin file provided
+by me on this web page, you'll see that the first 21 sectors are marked
+as 0001h in the FAT.&nbsp; This is to let the kernel know that these sectors
+are unavailable and cannot be used.&nbsp; What are they used for?&nbsp;
+They're used for the (boot_sector+FAT+root_table) = (1+12+8) = 21 sectors.</font><font face="Verdana"></font>
+<p><font face="Verdana">When a value contained in a FAT entry is between
+0002h and FFFEh, that means that the sector is used.&nbsp; If it is used,
+then the number contained there points to the next sector in the file's
+chain.&nbsp; I probably don't have to explain this any further because
+most people that are reading this are probably familiar with the way that
+MS-DOS's system works, which is very similar to this.&nbsp; Let me know
+if you want a further explanation.</font><font face="Verdana"></font>
+<p><b><u><font face="Verdana">The Root Directory Table</font></u></b><b><u><font face="Verdana"></font></u></b>
+<p><font face="Verdana">Immediately after the FAT starts the Root directory
+table.&nbsp; With the configuration that I've provided above, it is 8 sectors
+long.&nbsp; Each root directory entry is 32 bytes long, so each sector
+contains 512/32=16 root directory entries.&nbsp; There are 8 root directory
+sectors, so a disk formatted with this configuration can have a maximum
+of 8*16=128 files on it.&nbsp; You could make it bigger if you wanted to(as
+big as you want), but I thought that 128 files would be enough.</font><font face="Verdana"></font>
+<p><font face="Verdana">Here is the format of a root directory table entry(32
+bytes):</font><font face="Verdana"></font>
+<p><tt>00h&nbsp; +--------------------------------------------------------------------+</tt>
+<br><tt>&nbsp;&nbsp;&nbsp;&nbsp; |&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+File Name Before Extension&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+|</tt>
+<br><tt>10h&nbsp; +----------------+----------------+--------+--------+----------------+</tt>
+<br><tt>&nbsp;&nbsp;&nbsp;&nbsp; |&nbsp;&nbsp; Extension&nbsp;&nbsp;&nbsp;
+|&nbsp;&nbsp; File Size&nbsp;&nbsp;&nbsp; | Start&nbsp; | Atribs |&nbsp;&nbsp;
+Reserved&nbsp;&nbsp;&nbsp;&nbsp; |</tt>
+<br><tt>20h&nbsp; +----------------+----------------+--------+--------+----------------+</tt><font face="Verdana"></font>
+<p><font face="Verdana">This is how you would see it in a hex editor.&nbsp;
+The <i>File name before extension</i> field is 16 bytes long, and holds
+the file name without the extension or dot.&nbsp; The <i>Extension</i>
+field holds the extension which can be 4 bytes long.&nbsp; Both the file
+name and extension fields are padded with spaces if there are unused characters.&nbsp;
+The <i>file size</i> field is a dword indicating the file size in bytes.&nbsp;
+The <i>Start</i> field is a WORD containing the LBA address of the first
+sector of the file.&nbsp; The <i>Attribs</i> field is a WORD containing
+the various flags and attributes of that file.&nbsp; <i>Reserved</i> is
+reserved.</font><font face="Verdana"></font>
+<p><font face="Verdana">Here are the attributes that go in <i>attribs</i>
+field of the root table enties:</font><font face="Verdana"></font>
+<p><tt>0000000000000011b</tt>
+<br><tt>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+||</tt>
+<br><tt>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+|+-------- Readable</tt>
+<br><tt>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
++--------- Writable</tt><tt></tt>
+<p><font face="Verdana">Those are the only two flags that are currently
+supported.&nbsp; If the readable flag is not set, than the file is not
+readable.&nbsp; If the writable bit is not set, than the file is not writable.</font><font face="Verdana"></font>
+<p><b><u><font face="Verdana">Putting it all together to build an image</font></u></b><b><u><font face="Verdana"></font></u></b>
+<p><font face="Verdana">So, to build a new image, here are the steps you
+have to do:</font>
+<ol>
+<li>
+<font face="Verdana">Modify any of the source code that you want to change</font></li>
+
+<li>
+<font face="Verdana">Assemble them with A86</font></li>
+
+<li>
+<font face="Verdana">Copy the boot sector to the image.</font></li>
+
+<li>
+<font face="Verdana">Next copy an empty FAT to the image(all zero's) of
+the size that is specified in the disk parameter table in the boot sector.</font></li>
+
+<li>
+<font face="Verdana">Next create an empty root table(all zero's) of the
+size that is specified in the disk parameter table in the boot sector.</font></li>
+
+<li>
+<font face="Verdana">Next create a few entries in the first sector of the
+root table for two system files(os.sys, cmd.pgrm) and any other programs
+you wish to add.&nbsp; Fill out all the fields with the appropriate values.</font></li>
+
+<li>
+<font face="Verdana">Then modify the FAT to map out where on the disk you'll
+be putting the files.&nbsp; Make sure to terminate the chains with an FFFFh.</font></li>
+
+<li>
+<font face="Verdana">Next copy the files to the file data sectors at the
+location specified in the FAT.</font></li>
+
+<li>
+<font face="Verdana">You're done !</font></li>
+</ol>
+<font face="Verdana">If you have any questions, don't hesitate to e-mail
+me.</font>
+</body>
+</html>

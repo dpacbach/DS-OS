@@ -1,0 +1,279 @@
+DATA_AREA       = 400h
+
+        org     0
+
+        jmp     short start
+
+reserved        db 0                    ; reserved for OS.SYS(physical_drive)
+logical_drive   db 0                    ; logical drive of boot drive(HD only)
+sectors         db 18                   ; # of sectors per track
+heads           db 2                    ; # of heads
+boot_lba        dw 0,0                  ; lba address of boot sector
+fat_end         dw 13                   ; end of fat(relative to base)
+root_end        dw 21                   ; end of root(relative to base)
+
+start:
+        cli
+        mov     ax,9000h                ; new segment of boot sector
+        mov     es,ax
+        mov     ss,ax
+        xor     sp,sp                   ; first push will be at 9000:fffe
+        xor     di,di                   ; copy to es:di = 9000:0000
+        push    cs
+        pop     ds
+        mov     si,7c00h                ; copy from ds:si = 7c00:0000
+        cld                             ; go forward
+        mov     cx,100h                 ; move 100h words
+        rep     movsw                   ; do it
+        push    es
+        pop     ds                      ; ds = es = 9000h = new sector seg
+        push    ds                      ; push 9000h, new code segment
+        mov     ax,offset in_new_segment; where we'll be in new segment
+        push    ax                      ; push 0000h, new ip
+        retf
+in_new_segment:                         ; we're in the new segment(9000h)
+        sti
+
+        mov     [physical_drive],dl
+        mov     ah,0
+        int     13h                     ; reset disk system
+
+        mov     si,offset os_load_message
+        call    display_string          ; print os loading message
+
+        mov     cx,[fat_end]            ; start of root table
+next_sector:
+        push    cx
+        mov     ax,cx
+        mov     bx,DATA_AREA
+        call    read_sector             ; read next sector in root table
+        mov     di,DATA_AREA            ; di points to newly read sector
+next_entry:
+        push    di
+        mov     si,offset os_name       ; os.sys
+        cld
+        mov     cx,20                   ; file name + ext = 20 bytes
+        repe    cmpsb                   ; compare file name with os.sys
+        je      found_os
+        pop     di                      ; di = beginning of current entry
+        add     di,32                   ; go to next entry in current sector
+        cmp     di,DATA_AREA+200h       ; have we reached the end of sector?
+        jb      next_entry              ; if not, continue
+        pop     cx                      ; cx = current sector in root table
+        inc     cx                      ; go to next sector
+        cmp     cx,[root_end]           ; are we at the end of the root table?
+        jb      next_sector             ; if not, continue
+        mov     si,offset no_os_message ; 'os.sys not found...'
+        call    display_string
+        jmp     $
+found_os:
+        pop     di                      ; di = beggining of os.sys entry
+        pop     cx                      ; cx = sector of entry in root table
+        add     di,20                   ; di = entry+20, the file size(dword)
+        mov     si,offset os_size
+        xchg    si,di
+        movsw
+        movsw
+        mov     di,offset os_current_sector ; store starting sector of file
+        movsw
+        mov     ax,80h                  ; file load destination -- 80:0000
+        mov     es,ax
+load_os:
+        mov     bx,[os_bytes_loaded]    ; offset in segment 80 to load
+        mov     ax,[os_current_sector]  ; which sector to load
+        call    read_sector
+        add     w[os_bytes_loaded+1],2h ; add 200h to bytes loaded
+        mov     bx,[os_bytes_loaded]
+        cmp     bx,[os_size]            ; did we read the whole file?
+        jae     done_load_os            ; if so, we're done
+        mov     ax,[os_current_sector]  ; get current sector of file
+        shl     ax,1                    ; multiply by two
+        mov     cl,9
+        shr     ax,cl
+        inc     ax                              ; make it 1 based
+        cmp     ax,[current_sector_loaded]      ; is it already loaded?
+        je      sector_already_loaded           ; if so, don't load it
+        mov     [current_sector_loaded],ax      ; it's not loaded, so load it
+        mov     bx,DATA_AREA
+        push    es
+        push    cs
+        pop     es                              ; es = cs
+        call    read_sector                     ; read FAT sector
+        pop     es
+sector_already_loaded:
+        mov     si,[os_current_sector]          ; current file sector
+        shl     si,1                            ; multiply by two
+        and     si,200h-1                       ; mod it by 512
+        add     si,DATA_AREA        
+        lodsw                                   ; get next sector in file
+        mov     [os_current_sector],ax          ; store it
+        jmp     load_os                         ; again
+done_load_os:
+        mov     dl,cs:[physical_drive]
+        mov     dh,cs:[logical_drive]
+
+        push    es
+        pop     ds                              ; ds = es = 80h
+        push    es
+        xor     ax,ax
+        push    ax
+        retf                                    ; jump to 80:0000
+
+;-----------------------------------------------------------------------------
+
+; Sector   = (LBA mod SPT)+1
+; Head     = (LBA  /  SPT) mod Heads
+; Cylinder = (LBA  /  SPT)  /  Heads
+
+lba_to_chs:                     ; dx:ax = LBA
+        mov     di,w[sectors]   ; sectors per track
+        and     di,0ffh
+        call    divide_number
+        lea     bp,[si+1]
+        mov     dx,cx
+        mov     ax,bx
+        mov     di,w[heads]     ; heads per cylinder
+        and     di,0ffh
+        call    divide_number
+        mov     cx,si
+        mov     ax,bx           ; ax = cylinder
+        mov     dx,bp           ; cx = head
+        ret                     ; dx = sector
+
+;-----------------------------------------------------------------------------
+
+make_int_13:                    ; ax = LBA
+        call    lba_to_chs      ; ax(lba) -> (ax/cx/dx)(chs)
+        mov     bx,dx           ; bx = sectors
+        mov     dh,cl           ; dh = head number
+        mov     dl,[physical_drive] ; dl = drive
+        mov     ch,al           ; ch = lower 8 bits of cylinder
+        mov     cl,ah           ; cl = upper 2 bits of cylinder, 5 bit sector
+        ror     cl,1
+        ror     cl,1
+        add     cl,bl           ; add in sector
+        ret
+
+;-----------------------------------------------------------------------------
+
+read_sector:                    ; ax = LBA
+        push    bx              ; save buffer pointer
+        xor     dx,dx
+        add     ax,[boot_lba]   ; base it on the base of the partition
+        adc     dx,[boot_lba+2]
+        call    make_int_13
+        pop     bx              ; restore buffer pointer
+        mov     ax,3
+check_loop:
+        push    ax
+        mov     ax,201h
+        int     13h                     ; do the read/write
+        jnc     int13_no_error
+        xor     ah,ah
+        int     13h                     ; reset disk
+        pop     ax
+        dec     ax
+        jnz     check_loop              ; try again
+        stc                             ; no success, carry = 1
+        push    ax
+int13_no_error:
+        pop     ax
+        ret
+
+;-----------------------------------------------------------------------------
+
+display_string:                 ; ds:si = asciiz message
+        push    si
+display_loop:
+        cld
+        lodsb
+        or      al,al
+        jz      end_string
+        mov     ah,0eh          ; function 0eh, output character
+        xor     bx,bx           ; video page 0
+        int     10h
+        jmp     display_loop
+end_string:
+        pop     si
+        ret
+
+;-----------------------------------------------------------------------------
+
+divide_number:                  ; dx:ax = number
+                                ; di = divisor
+                                ; ret: cx:bx = answer, si = remainder
+        push    ax
+        push    dx
+        push    di
+
+        xor     bl,bl
+        push    ax
+        xchg    dx,ax
+        xor     dx,dx
+        div     di
+        mov     cx,ax
+        pop     ax
+        push    ax
+        mov     al,ah
+        mov     ah,dl
+        mov     dl,dh
+        xor     dh,dh
+        div     di
+        mov     bh,al
+        add     cl,ah
+        adc     ch,0
+        pop     ax
+        xor     ah,ah
+        mov     ah,dl
+        mov     dl,dh
+        xor     dh,dh
+        div     di
+        add     bx,ax
+        adc     cx,0
+        mov     si,dx
+
+        pop     di
+        pop     dx
+        pop     ax
+        ret
+
+;      0   r-fffe
+;     ------             res1 = (big_num>>16)/divisor
+;ffff |fffe              mod1 = (big_num>>16)%divisor
+;
+;
+;      ff  r-fffe
+;     -------            res2 = (((big_num&ff00h)>>8)+(mod1<<8))/divisor
+;ffff |fffeff            mod2 = (((big_num&ff00h)>>8)+(mod1<<8))%divisor
+;
+;
+;      ff  r-fffd
+;     -------            res3 = ((big_num&ffh)+(mod2<<8))/divisor
+;ffff |fffefe            mod3 = ((big_num&ffh)+(mod2<<8))%divisor
+;
+;0000
+;  00ff
+;    00ff
+;--------r-fffd          answer    = res1+res2+res3
+;    ffff                remainder = mod3
+
+
+os_load_message         db 'Starting DS-OS...',13,10,13,10,0
+no_os_message           db 'OS.SYS not found!',0
+os_name                 db 'OS              SYS '
+os_bytes_loaded         dw 0
+os_current_sector       dw 0
+current_sector_loaded   dw 0
+
+        org     200h-2
+        
+        dw      0AA55h
+
+data    segment
+
+        physical_drive          db ?
+        os_size                 dw ?,?
+
+data    ends
+
+end

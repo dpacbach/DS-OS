@@ -1,0 +1,1136 @@
+
+        ; command interpreter for DS-OS(command.pgrm)
+
+include macros.inc
+
+        org     0
+
+        ; initailize
+
+        mov     cs:[psp_seg],ds
+        push    cs
+        pop     ds
+        push    cs
+        pop     es
+
+        ; print intro string
+
+        mov     ah,10h
+        mov     dx,offset intro
+        int     20h
+
+prompt_loop:
+        call    display_prompt
+        mov     ah,10h
+        mov     dx,offset new_line
+        int     20h
+        cmp     b[command_buffer],0
+        je      prompt_loop
+        xor     ch,ch
+        mov     cl,[num_commands]
+test_commands:
+        push    cx
+        mov     di,cx
+        dec     di
+        shl     di,1
+        shl     di,1
+        add     di,offset cmd_strings
+        mov     di,[di]
+        mov     si,offset command_buffer
+        call    cmp_string
+        je      found_string
+        pop     cx
+        loop    test_commands
+
+        push    ds
+        push    es
+        mov     di,offset command_buffer
+        call    str_len
+        mov     al,'.'
+        cld
+        repne   scasb
+        je      no_add_pgrm
+        mov     di,offset command_buffer
+        call    str_len
+        add     di,cx
+        mov     al,'.'
+        stosb
+        mov     al,'P'
+        stosb
+        mov     al,'G'
+        stosb
+        mov     al,'R'
+        stosb
+        mov     al,'M'
+        stosb
+        xor     al,al
+        stosb
+no_add_pgrm:
+        mov     di,offset load_struct
+        mov     ax,offset command_buffer
+        stosw
+        mov     ax,cs
+        stosw
+        mov     ax,offset prompt_buffer
+        stosw
+        mov     ax,cs
+        stosw
+        push    di
+        mov     di,offset prompt_buffer
+        call    str_len
+        pop     di
+        mov     ax,cx
+        stosw
+        mov     ax,[psp_seg]
+        stosw
+        mov     ax,offset prog_end_here
+        stosw
+        mov     ax,cs
+        stosw
+        mov     ax,sp
+        stosw
+        mov     ax,ss
+        stosw
+        xor     ax,ax
+        stosw
+        mov     dx,offset load_struct
+        mov     ah,5
+        int     20h
+
+prog_end_here:
+        pop     es
+        pop     ds
+        jc      error
+        jmp     done_command
+
+        jmp     error
+found_string:
+        pop     cx
+        mov     di,cx
+        dec     di
+        shl     di,1
+        shl     di,1
+        add     di,offset cmd_strings
+        mov     ax,offset done_command
+        push    ax
+        push    w[di+2]
+        ret
+
+done_command:
+        jmp     prompt_loop
+
+error:
+        mov     ah,10h
+        mov     dx,offset error_str
+        int     20h
+
+        jmp     prompt_loop
+
+;-----------------------------------------------------------------------------
+
+display_prompt:
+        push    ds
+        push    es
+        push    cs
+        pop     ds
+        push    cs
+        pop     es
+        mov     ah,16h
+        int     20h
+        mov     ah,12h
+        int     20h
+        mov     ah,10h
+        mov     dx,offset prompt
+        int     20h
+        mov     ah,11h
+        mov     cx,76
+        mov     dx,offset prompt_buffer
+        int     20h
+        mov     si,offset prompt_buffer
+        mov     di,si
+        cld
+to_upper_loop:
+        lodsb
+        or      al,al
+        je      end_to_upper
+        cmp     al,'a'
+        jb      not_lower
+        cmp     al,'z'
+        ja      not_lower
+        sub     al,32
+not_lower:
+        stosb
+        jmp     to_upper_loop
+end_to_upper:
+        mov     si,offset prompt_buffer
+        mov     di,offset command_buffer
+parse_loop:
+        lodsb
+        or      al,al
+        jz      end_parse
+        cmp     al,20h
+        je      end_parse
+        cmp     al,9
+        je      end_parse
+        stosb
+        jmp     parse_loop
+end_parse:
+        xor     al,al
+        stosb
+        dec     si
+        mov     di,offset prompt_buffer
+copy_loop:
+        lodsb
+        or      al,al
+        jz      end_cmd_tail
+        stosb
+        jmp     copy_loop
+end_cmd_tail:
+        stosb
+        pop     es
+        pop     ds
+        ret
+
+;-----------------------------------------------------------------------------
+
+str_len:                                ; es:di = ASCIIZ string
+                                        ; ret: cx = length
+        push    ax
+        push    di
+        xor     al,al
+        cld
+        mov     cx,-1
+        repne   scasb
+        pop     cx
+        dec     di
+        xchg    di,cx
+        sub     cx,di
+        pop     ax
+        ret
+
+;-----------------------------------------------------------------------------
+
+cmp_string:                             ; ds:si = string1
+                                        ; es:di = string2
+                                        ; ZF = status(je/jne)
+        push    si
+        push    di
+        cld
+cmp_loop:
+        cmpsb
+        jne     cmp_ne
+        cmp     b[si],0
+        jne     cmp_loop
+        cmp     b[di],0
+        jne     cmp_loop
+cmp_ne:
+        pop     di
+        pop     si
+        ret
+
+;-----------------------------------------------------------------------------
+
+display_version:                        ; displays version string
+        mov     ah,10h
+        mov     dx,offset version_string
+        int     20h
+        ret
+
+;-----------------------------------------------------------------------------
+
+display_dir:                            ; displays the current directory
+                                        ; according to mask
+        push    ds
+        push    es
+        push    cs
+        pop     ds
+        push    cs
+        pop     es
+
+        mov     w[size_accum],0
+        mov     w[size_accum+2],0
+
+        mov     ax,1800h                ; turn off sector invalidation
+        int     20h
+        mov     ax,1901h                ; enable drive parameter caching
+        int     20h
+
+        mov     ah,0fh
+        mov     si,offset cmd_dta
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset dir_heading
+        int     20h
+
+        mov     di,offset mask_all
+        mov     si,offset prompt_buffer
+        cld
+find_mask:
+        lodsb
+        or      al,al
+        jz      use_default_mask
+        cmp     al,20h
+        je      find_mask
+        cmp     al,9
+        je      find_mask
+        lea     di,[si-1]
+use_default_mask:
+        push    di
+        mov     si,di
+find_end:
+        lodsb
+        or      al,al
+        jz      found_end
+        cmp     al,20h
+        je      found_end
+        cmp     al,9
+        jne     find_end
+found_end:
+        mov     b[si-1],0
+        mov     ah,3
+find_next:
+        pop     dx
+        push    dx
+        mov     cx,3
+        int     20h
+        jc      no_more
+        mov     ah,14h
+        mov     dx,offset cmd_dta
+        mov     di,offset exp_name
+        int     20h
+        mov     cx,16
+        mov     si,offset exp_name
+print_first_name:
+        lodsb
+        mov     ah,12h
+        int     20h
+        loop    print_first_name
+        mov     ax,1220h
+        int     20h
+        mov     cx,4
+        mov     si,offset exp_name+16
+print_last_name:
+        lodsb
+        mov     ah,12h
+        int     20h
+        loop    print_last_name
+
+        mov     cx,[cmd_dta+24]
+        mov     dx,[cmd_dta+22]
+        add     [size_accum],dx
+        adc     [size_accum+2],cx
+        mov     di,offset number_buffer
+        mov     bx,1604h
+        mov     ax,1a09h
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset number_buffer
+        int     20h
+
+        mov     ax,1220h
+        int     20h
+
+        mov     bl,[cmd_dta+28]
+        mov     cx,4
+        shl     bl,cl
+        mov     si,offset attribs
+put_attribs:
+        mov     al,20h
+        shl     bl,1
+        jnc     put_attrib_space
+        mov     al,[si]
+put_attrib_space:
+        mov     ah,12h
+        int     20h
+        inc     si
+        loop    put_attribs
+
+        mov     ah,10h
+        mov     dx,offset new_line
+        int     20h
+        mov     ah,4
+        jmp     find_next
+no_more:
+        pop     dx
+
+        mov     cx,[size_accum+2]
+        mov     dx,[size_accum]
+        mov     di,offset number_buffer
+        mov     bx,1604h
+        mov     ax,1a1eh
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset number_buffer
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset dir_ending
+        int     20h
+
+        mov     ax,1801h                ; turn on sector invalidation
+        int     20h
+        mov     ax,1900h                ; turn off drive parameter caching
+        int     20h
+
+        pop     es
+        pop     ds
+        ret
+
+;-----------------------------------------------------------------------------
+
+clear_screen:                           ; will clear the screen and put the
+                                        ; cursor position in the upper left.
+        push    es
+        mov     ax,0b800h
+        mov     es,ax
+        xor     di,di
+        mov     ax,720h
+        cld
+        mov     cx,80*25*4
+        shr     cx,1
+        rep     stosw
+        mov     ah,2
+        xor     bx,bx
+        xor     dx,dx
+        int     10h
+        pop     es
+        ret
+
+;-----------------------------------------------------------------------------
+
+exit_command:                           ; will exit(this won't return)
+        mov     ah,6
+        int     20h
+
+;-----------------------------------------------------------------------------
+
+switch_drive:                           ; will switch to the given drive
+        push    ds
+        push    cs
+        pop     ds
+        mov     si,offset prompt_buffer
+find_drive:
+        lodsb
+        or      al,al
+        jz      no_drive_here
+        cmp     al,20h
+        je      find_drive
+        cmp     al,9
+        je      find_drive
+        mov     ah,15h
+        int     20h
+        jc      no_drive_here
+        jmp     good_drive
+no_drive_here:
+        mov     ah,10h
+        mov     dx,offset invalid_drive
+        int     20h
+good_drive:
+        pop     ds
+        ret
+
+;-----------------------------------------------------------------------------
+
+display_help:
+        mov     ah,10h
+        mov     dx,offset help_string
+        int     20h
+        ret
+
+;-----------------------------------------------------------------------------
+
+get_params:                             ; ds:si = params(ASCIIZ)
+        cld                             ; es = cs
+        mov     w[cs:num_params],0
+        mov     di,offset params
+        xor     bl,bl
+params_loop:
+        lodsb
+        cmp     al,0
+        je      no_more_params
+        cmp     al,20h
+        je      white_space
+        cmp     al,9
+        je      white_space
+        or      bl,bl
+        jnz     params_loop
+        lea     ax,[si-1]
+        stosw
+        inc     w[cs:num_params]
+        inc     bl
+        jmp     params_loop
+white_space:
+        or      bl,bl
+        jz      no_terminate_param
+        mov     b[si-1],0
+no_terminate_param:
+        xor     bl,bl
+        jmp     params_loop
+no_more_params:
+        ret
+
+;-----------------------------------------------------------------------------
+
+copy_file:                              ; copy's one file to another
+        mov     si,offset prompt_buffer
+        call    get_params
+        cmp     w[num_params],1
+        je      good_params_copy
+        cmp     w[num_params],2
+        je      good_params_copy
+        jmp     bad_params_copy
+
+good_params_copy:
+        mov     ax,1800h                ; turn off sector invalidation
+        int     20h
+        mov     ax,1901h                ; enable drive parameter caching
+        int     20h
+
+        mov     ah,0fh
+        mov     si,offset cmd_dta
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset new_line
+        int     20h
+
+        mov     ah,3
+copy_next_file:
+        mov     dx,[params]
+        mov     cx,3
+        int     20h
+        jnc     found_copy_file
+        jmp     no_more_copy
+
+found_copy_file:
+        mov     di,offset temp_buffer
+        mov     ah,16h
+        int     20h
+        mov     si,[params]
+        cmp     b[si+1],':'
+        jne     no_drive_source
+        mov     al,[si]
+no_drive_source:
+        stosb
+        mov     al,':'
+        stosb
+        mov     si,offset cmd_dta
+        mov     cx,22
+        rep     movsb
+
+        cmp     w[num_params],2
+        je      two_params_copy
+
+        mov     di,offset temp_buffer2
+        mov     ah,16h
+        int     20h
+        stosb
+        mov     al,':'
+        stosb
+        push    di
+        mov     di,offset cmd_dta
+        call    str_len
+        pop     di
+        inc     cx
+        mov     si,offset cmd_dta
+        rep     movsb
+        jmp     dest_calculated
+
+two_params_copy:
+        mov     dx,[params+2]
+        mov     di,offset exp_name
+        mov     ah,14h
+        int     20h
+        jnc     good_second_param_copy
+        jmp     bad_params_restore
+
+good_second_param_copy:
+        mov     [param2_drive],al
+
+        mov     dx,offset cmd_dta
+        mov     di,offset exp_name2
+        mov     ah,14h
+        int     20h
+
+        cmp     b[exp_name],'*'
+        jne     no_copy_first_name
+        mov     si,offset exp_name2
+        mov     di,offset exp_name
+        mov     cx,16
+        rep     movsb
+no_copy_first_name:
+        cmp     b[exp_name+16],'*'
+        jne     no_copy_last_name
+        mov     si,offset exp_name2+16
+        mov     di,offset exp_name+16
+        mov     cx,4
+        rep     movsb
+no_copy_last_name:
+
+        mov     di,offset temp_buffer2
+        mov     al,[param2_drive]
+        stosb
+        mov     al,':'
+        stosb
+        mov     ah,1bh
+        mov     dx,offset exp_name
+        int     20h
+
+dest_calculated:
+        mov     ah,10h
+        mov     dx,offset temp_buffer
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset arrow
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset temp_buffer2
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset dotdotdot
+        int     20h
+
+        mov     si,offset temp_buffer
+        mov     di,offset temp_buffer2
+        call    cmp_string
+        je      the_same_file
+
+        mov     ax,0000h
+        mov     dx,offset temp_buffer
+        int     20h
+        jnc     good_open_1
+
+        mov     ah,10h
+        mov     dx,offset no_open_source
+        int     20h
+
+        jmp     good_copy
+
+good_open_1:
+        mov     [handle1],bx
+        mov     ah,01h
+        mov     dx,offset temp_buffer2
+        mov     cx,3
+        int     20h
+        jnc     good_open_2
+
+        mov     bx,[handle1]
+        mov     ah,7
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset no_open_dest
+        int     20h
+
+        jmp     good_copy
+
+good_open_2:
+        mov     [handle2],bx
+
+copy_the_files:
+        mov     ah,8
+        mov     bx,[handle1]
+        mov     cx,512
+        mov     dx,offset disk_buffer
+        int     20h
+        or      ax,ax
+        jz      end_copy_files
+
+        mov     cx,ax
+        mov     ah,9
+        mov     bx,[handle2]
+        mov     dx,offset disk_buffer
+        int     20h
+
+        jmp     copy_the_files
+
+end_copy_files:
+        mov     bx,[handle1]
+        mov     ah,7
+        int     20h
+        mov     bx,[handle2]
+        mov     ah,7
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset success
+        int     20h
+
+        jmp     good_copy
+
+the_same_file:
+        mov     ah,10h
+        mov     dx,offset same_file
+        int     20h
+
+good_copy:
+        mov     ah,10h
+        mov     dx,offset new_line
+        int     20h
+
+        mov     ah,4
+        jmp     copy_next_file
+
+no_more_copy:
+
+copy_success:
+        mov     ax,1801h                ; turn on sector invalidation
+        int     20h
+        mov     ax,1900h                ; disable drive parameter caching
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset new_line
+        int     20h
+
+        jmp     done_copy
+
+bad_params_restore:
+        mov     ax,1801h                ; turn on sector invalidation
+        int     20h
+        mov     ax,1900h                ; disable drive parameter caching
+        int     20h
+
+bad_params_copy:
+        mov     ah,10h
+        mov     dx,offset bad_params
+        int     20h
+
+done_copy:
+        ret
+
+;-----------------------------------------------------------------------------
+
+rename_file:
+        mov     si,offset prompt_buffer
+        call    get_params
+        cmp     w[num_params],2
+        je      good_params_ren
+        jmp     bad_params_ren
+
+good_params_ren:
+        mov     ax,1800h                ; turn off sector invalidation
+        int     20h
+        mov     ax,1901h                ; enable drive parameter caching
+        int     20h
+
+        mov     ah,0fh
+        mov     si,offset cmd_dta
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset new_line
+        int     20h
+
+        mov     ah,3
+ren_next_file:
+        mov     dx,[params]
+        mov     cx,3
+        int     20h
+        jnc     found_ren_file
+        jmp     no_more_ren
+
+found_ren_file:
+        mov     di,offset temp_buffer
+        mov     ah,16h
+        int     20h
+        mov     si,[params]
+        cmp     b[si+1],':'
+        jne     no_drive_source_ren
+        mov     al,[si]
+no_drive_source_ren:
+        stosb
+        mov     al,':'
+        stosb
+        mov     si,offset cmd_dta
+        mov     cx,22
+        rep     movsb
+
+        mov     dx,[params+2]
+        mov     di,offset exp_name
+        mov     ah,14h
+        int     20h
+        jnc     good_second_param_ren
+        jmp     bad_params_restore_ren
+
+good_second_param_ren:
+        mov     [param2_drive],al
+
+        mov     dx,offset cmd_dta
+        mov     di,offset exp_name2
+        mov     ah,14h
+        int     20h
+
+        cmp     b[exp_name],'*'
+        jne     no_ren_first_name
+        mov     si,offset exp_name2
+        mov     di,offset exp_name
+        mov     cx,16
+        rep     movsb
+no_ren_first_name:
+        cmp     b[exp_name+16],'*'
+        jne     no_ren_last_name
+        mov     si,offset exp_name2+16
+        mov     di,offset exp_name+16
+        mov     cx,4
+        rep     movsb
+no_ren_last_name:
+
+        mov     di,offset temp_buffer2
+        mov     al,[param2_drive]
+        stosb
+        mov     al,':'
+        stosb
+        mov     ah,1bh
+        mov     dx,offset exp_name
+        int     20h
+
+dest_calculated_ren:
+        mov     ah,10h
+        mov     dx,offset temp_buffer
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset arrow
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset temp_buffer2
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset dotdotdot
+        int     20h
+
+        mov     si,offset temp_buffer
+        mov     di,offset temp_buffer2
+        call    cmp_string
+        je      the_same_file_ren
+
+        mov     si,offset temp_buffer
+        mov     di,offset temp_buffer2
+        mov     ah,1ch
+        int     20h
+        jc      error_ren_file
+
+        mov     ah,10h
+        mov     dx,offset success
+        int     20h
+
+        jmp     good_ren
+
+error_ren_file:
+        mov     ah,10h
+        mov     dx,offset error_msg
+        int     20h
+
+        jmp     good_ren
+
+the_same_file_ren:
+        mov     ah,10h
+        mov     dx,offset same_file
+        int     20h
+
+good_ren:
+        mov     ah,10h
+        mov     dx,offset new_line
+        int     20h
+
+        mov     ah,4
+        jmp     ren_next_file
+
+no_more_ren:
+
+ren_success:
+        mov     ax,1801h                ; turn on sector invalidation
+        int     20h
+        mov     ax,1900h                ; disable drive parameter caching
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset new_line
+        int     20h
+
+        jmp     done_ren
+
+bad_params_restore_ren:
+        mov     ax,1801h                ; turn on sector invalidation
+        int     20h
+        mov     ax,1900h                ; disable drive parameter caching
+        int     20h
+
+bad_params_ren:
+        mov     ah,10h
+        mov     dx,offset bad_params
+        int     20h
+
+done_ren:
+        ret
+
+;-----------------------------------------------------------------------------
+
+delete_file:
+        mov     si,offset prompt_buffer
+        call    get_params
+        cmp     w[num_params],1
+        je      good_params_del
+        jmp     bad_params_del
+
+good_params_del:
+        mov     ax,1800h                ; turn off sector invalidation
+        int     20h
+        mov     ax,1901h                ; enable drive parameter caching
+        int     20h
+
+        mov     ah,0fh
+        mov     si,offset cmd_dta
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset new_line
+        int     20h
+
+        mov     ah,3
+del_next_file:
+        mov     dx,[params]
+        mov     cx,3
+        int     20h
+        jc      no_more_del
+
+        mov     di,offset temp_buffer
+        mov     ah,16h
+        int     20h
+        mov     si,[params]
+        cmp     b[si+1],':'
+        jne     no_drive_del
+        mov     al,[si]
+no_drive_del:
+        stosb
+        mov     al,':'
+        stosb
+        mov     si,offset cmd_dta
+        mov     cx,22
+        rep     movsb
+        
+        mov     ah,10h
+        mov     dx,offset temp_buffer
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset new_line
+        int     20h
+
+        mov     ah,2
+        mov     dx,offset temp_buffer
+        int     20h
+
+        mov     ah,4
+        jmp     del_next_file
+
+no_more_del:
+        mov     ax,1801h
+        int     20h
+        mov     ax,1900h
+        int     20h
+
+        mov     ah,10h
+        mov     dx,offset new_line
+        int     20h
+
+        jmp     done_del
+
+bad_params_del:
+        mov     ah,10h
+        mov     dx,offset bad_params
+        int     20h
+
+done_del:
+        ret
+
+;-----------------------------------------------------------------------------
+
+        intro           db 13,10,"DS-OS Command Interpreter v1.0"
+                        db 13,10,"     (c) 1999 by David Sicilia"
+                        db 13,10,13,10,0
+
+        prompt          db ':>',0
+
+        psp_seg         dw 0
+
+        version_string  db 'DS-OS Command Interpreter v1.0',13,10,13,10,0
+
+        cmd_dta         db 32 dup(0)
+        mask_all        db '*.*',0
+        dir_heading     db 13,10
+                        db 'Name             Ext      Size Attr',13,10
+                        db '---------------- ----  ------- ----'
+                        db 13,10,0
+        dir_ending      db ' total',13,10
+                        db 13,10,0
+
+        attribs         db '  WR'
+
+        handle1         dw 0
+        handle2         dw 0
+        exp_name        db 20 dup(0)
+        exp_name2       db 20 dup(0)
+        number_buffer   db 20 dup(0)
+        size_accum      dw 0,0
+        params          dw 0,0,0,0,0,0,0,0,0,0
+        num_params      dw 0
+        param2_drive    db 0
+
+        same_file       db 'same file!',0
+        success         db 'success',0
+        error_msg       db 'error',0
+        no_open_source  db "Can't open source!",0
+        no_open_dest    db "Can't create destination file!",0
+        dotdotdot       db '...',0
+        arrow           db ' --> ',0
+
+        invalid_drive   db 'Invalid drive!',13,10,13,10,0
+
+        bad_params      db 'Bad parameters!',13,10,13,10,0
+
+        error_str       db 'Unrecognized command!',13,10,13,10,0
+
+        new_line        db 13,10,0
+
+        temp_buffer     db 76 dup(0)
+        temp_buffer2    db 76 dup(0)
+        prompt_buffer   db 76 dup(0)
+        command_buffer  db 76 dup(0)
+
+        num_commands    db 9
+
+        version_str     db 'VERSION',0
+        dir_str         db 'DIR',0
+        cls_str         db 'CLS',0
+        exit_str        db 'EXIT',0
+        drive_str       db 'DRIVE',0
+        help_str        db 'HELP',0
+        copy_str        db 'COPY',0
+        del_str         db 'DEL',0
+        rename_str      db 'RENAME',0
+
+        cmd_strings     dw offset version_str, offset display_version
+                        dw offset dir_str, offset display_dir
+                        dw offset cls_str, offset clear_screen
+                        dw offset exit_str, offset exit_command
+                        dw offset drive_str, offset switch_drive
+                        dw offset help_str, offset display_help
+                        dw offset copy_str, offset copy_file
+                        dw offset del_str, offset delete_file
+                        dw offset rename_str, offset rename_file
+
+        help_string     db 13,10
+                        db 'DS-OS Command Interpreter',13,10
+                        db '      (c) 1999 by David Sicilia',13,10
+                        db 13,10
+                        db 'The following is a list of supported',13,10
+                        db 'commands.',13,10
+                        db 13,10
+                        db 'version  This will show the version of',13,10
+                        db '         the command interpreter that', 13,10
+                        db '         you are using.',               13,10
+                        db '    dir  Will list all of the files in',13,10
+                        db '         the current directory',        13,10
+                        db '    cls  Will clear the screen and put',13,10
+                        db '         the cursor in the upper left', 13,10
+                        db '         hand corner of the screen',    13,10
+                        db '   exit  This will exit the command',   13,10
+                        db '         interpreter',                  13,10
+                        db '  drive  Will switch the current drive',13,10
+                        db '   help  Will display this help screen',13,10
+                        db '   copy  Will copy files to another',   13,10
+                        db '         drive or directory.',          13,10
+                        db '    del  Will delete files.',           13,10
+                        db ' rename  Will rename files.',           13,10
+                        db 13,10,0
+
+        load_struct     dw command_buffer,0  ; seg:off of ASCIIZ file name
+                        dw prompt_buffer,0   ; seg:off of ASCIIZ command line
+                        dw 0                 ; size of cmd line(size<=255)
+                        dw 0                 ; psp seg of parent
+                        dw prog_end_here,0   ; cs:ip to go to when program is done
+                        dw 0,0               ; ss:sp to use when prog is done
+                        dw 0                 ; flags: bit 0   = run?
+                                             ;        bit 1-7 = unused
+                        dw 0                 ; unused
+                        dd 0,0               ; unused
+
+        disk_buffer     db 512 dup(0)
+
+end
+
+;        process_table   dw offset open_file       ; 00h
+;                        dw offset create_file     ; 01h
+;                        dw offset delete_file     ; 02h
+;                        dw offset find_first      ; 03h
+;                        dw offset find_next       ; 04h
+;                        dw offset load_prog       ; 05h
+;                        dw offset end_program     ; 06h
+;                        dw offset close_file      ; 07h
+;                        dw offset read_file       ; 08h
+;                        dw offset write_file      ; 09h
+;                        dw offset seek_file       ; 0Ah
+;                        dw offset mem_allocate    ; 0Bh
+;                        dw offset mem_free        ; 0Ch
+;                        dw offset mem_resize      ; 0Dh
+;                        dw offset get_dta         ; 0Eh
+;                        dw offset set_dta         ; 0Fh
+;                        dw offset print_string    ; 10h
+;                        dw offset get_string      ; 11h
+;                        dw offset print_character ; 12h
+;                        dw offset get_character   ; 13h
+;                        dw offset name_expand     ; 14h
+;                        dw offset drive_change    ; 15h
+;                        dw offset get_drive       ; 16h
+;                        dw offset get_version     ; 17h
+;                        dw offset set_invalidation; 18h
+;                        dw offset set_drv_caching ; 19h
+;                        dw offset bin_to_ascii    ; 1Ah
+;                        dw offset name_crunch     ; 1Bh
+;                        dw offset rename_file     ; 1Ch
+
+                                       ; |C|B|A|9|8|7|6|5|4|3|2|1|0|
+                                       ;  | | | | | | | | | | | | |
+                                       ;  | | | | | | | | | | | | |
+                                       ;  | | | | | | | | | | | ^-^-base
+                                       ;  | | | | | | | | | | ^-----align
+                                       ;  | | | | | | | | | ^-------put base
+                                       ;  | | | | | | | | ^---------hex case
+                                       ;  | | | | | | | ^-----------pad h/b
+                                       ;  | | | | | | ^-------------dec sign
+                                       ;  | | | | | ^---------------base case
+                                       ;  | | | | ^-----------------pad char
+                                       ;  | | ^-^-------------------size
+                                       ;  | ^-----------------------zero hex
+                                       ;  ^-------------------------dec comma
+                                       ;
+                                       ;  All other bits should be zero.
+                                       ;
+                                       ;      Base: 0 = decimal   1 = hex
+                                       ;            2 = binary    3 = octal
+                                       ;
+                                       ;     Align: 0 = left      1 = right
+                                       ;
+                                       ;  Hex case: 0 = lower     1 = upper
+                                       ;
+                                       ;  Dec sign: 0 = unsigned  1 = signed
+                                       ;
+                                       ; Base case: 0 = lower     1 = upper
+                                       ;
+                                       ;  Pad what: 0 = zero's    1 = spaces
+                                       ;
+                                       ;      Size: 0 = nibble    1 = byte
+                                       ;            2 = word      3 = dword
+                                       ;
+                                       ;  Zero hex: 0 = no zero,1 = yes zero
+

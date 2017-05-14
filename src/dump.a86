@@ -1,0 +1,314 @@
+; DUMP.A86 -- This program will dump a file in hex to the screen.
+; Note: Do not assemble this for MS-DOS as it will not work.  It only works
+; (and is included with) the DS-OS operating system.
+;
+; Some things to note that are different from MS-DOS is the 'ORG 0' at the
+; top.  Also, the strings to be printed are terminated with a null zero,
+; instead of that annoying dollar sign.  Also notice that the operating
+; system is called via INT 20h, not 21h.
+
+	org	0
+
+	mov	cx,[0]
+	or	cx,cx
+	jnz	cmd_line
+
+display_exit:
+        push    cs
+        pop     ds
+        mov     ah,10h
+        mov     dx,offset intro
+        int     20h
+	jmp	exit
+
+cmd_line:
+	push	ds
+	pop	es
+	mov	di,0100h
+	mov	al,20h
+	mov	cx,0100h
+	cld
+	repe	scasb
+	je	display_exit
+	dec	di
+
+	push	cs
+	pop	es
+
+	mov	dx,di
+	mov	ax,0002h
+	int	20h
+	jnc	dont_exit
+	jmp	exit
+
+dont_exit:
+	mov	ax,1800h
+	int	20h
+
+	push	cs
+	pop	ds
+
+	mov	[handle],bx
+
+	mov	ax,0a02h
+	xor	cx,cx
+	xor	dx,dx
+	int	20h
+
+	mov	[file_size],ax
+
+	mov	ax,0a00h
+	xor	cx,cx
+	xor	dx,dx
+	int	20h
+
+	call	new_line
+
+dump_loop:
+	call	put_address
+	call	put_space
+	call	put_space
+	mov	ax,[current_address]
+	mov	bx,[file_size]
+	mov	cx,10h
+	and	ax,0fff0h
+	and	bx,0fff0h
+	cmp	ax,bx
+	jne	not_last_line
+	mov	bx,[file_size]
+	mov	ax,[current_address]
+	sub	bx,ax
+	mov	cx,bx
+not_last_line:
+	push	cx
+
+byte_loop:
+	push	cx
+	call	put_byte
+	call	put_space
+	pop	cx
+	loop	byte_loop
+
+	call	put_space
+	call	put_space
+
+	pop	ax
+	push	ax
+
+	mov	cx,10h
+	sub	cx,ax
+	jcxz	no_pad_spaces
+pad_spaces:
+	push	cx
+	call	put_space
+	call	put_space
+	call	put_space
+	pop	cx
+	loop	pad_spaces
+
+no_pad_spaces:
+	pop	cx
+	mov	bp,cx
+char_loop:
+	push	cx
+
+	call	put_char
+
+	pop	cx
+	loop	char_loop
+
+	call	new_line
+	cmp	byte ptr [ask_for_key],0
+	je	test_file_end
+	inc	byte ptr [line_count]
+	cmp	byte ptr [line_count],22
+	jne	test_file_end
+	mov	byte ptr [line_count],0
+	call	more
+test_file_end:
+	mov	ax,[current_address]
+	cmp	ax,[file_size]
+	je	close_file
+;	mov	ax,[cache_pos]
+;	mov	bx,[cache_size]
+;	add	bx,offset disk_cache
+;	cmp	ax,bx
+;	jae	close_file
+	jmp	dump_loop
+
+close_file:
+	mov	bx,[handle]
+	mov	ah,7
+	int	20h
+
+exit:
+	mov	ax,1801h
+	int	20h
+
+	mov	ax,0600h
+	int	20h
+
+put_char:
+	mov	ax,122eh
+	mov	di,offset temp_para
+	mov	bx,bp
+	sub	bx,cx
+	add	di,bx
+skip_neg:
+	cmp	byte ptr [di],33
+	jb	skip
+	cmp	byte ptr [di],127
+	ja	skip
+	mov	al,[di]
+skip:
+	int	20h
+	ret
+
+put_byte:
+	mov	bx,[cache_pos]
+	mov	ax,[cache_size]
+	add	ax,offset disk_cache
+	cmp	ax,bx
+	jne	no_reload
+
+	mov	ah,8
+	mov	bx,[handle]
+	mov	cx,512
+	mov	dx,offset disk_cache
+	int	20h
+
+	mov	w[cache_pos],offset disk_cache
+	mov	[cache_size],ax
+	mov	bx,offset disk_cache
+
+no_reload:
+	mov	di,[current_address]
+	and	di,0fh
+	add	di,offset temp_para
+	mov	al,[bx]
+	stosb
+	inc	w[cache_pos]
+	mov	[temp_byte],al
+	inc	word ptr [current_address]
+	mov	al,[temp_byte]
+	mov	cl,4
+	shr	al,cl
+	xor	ah,ah
+	call	put_hex_num
+	mov	al,[temp_byte]
+	and	al,0fh
+	xor	ah,ah
+	call	put_hex_num
+	ret
+
+put_space:
+	mov	ax,1220h
+	int	20h
+	ret
+
+new_line:
+	mov	ax,120dh
+	int	20h
+	mov	ax,120ah
+	int	20h
+	ret
+
+put_address:
+	push	ax 
+	push	bx 
+	push	cx 
+	push	dx
+	mov	cx,4
+put_zeros:
+	mov	ah,12h
+	mov	al,'0'
+	int	20h
+	loop	put_zeros
+	mov	ah,12h
+	mov	al,':'
+	int	20h
+	mov	ax,[current_address]
+	mov	cl,12
+	shr	ax,cl
+	call	put_hex_num
+	mov	ax,[current_address]
+	mov	cl,8
+	shr	ax,cl
+	and	al,0fh
+	call	put_hex_num
+	mov	ax,[current_address]
+	mov	cl,4
+	shr	ax,cl
+	and	ax,000fh
+	call	put_hex_num
+	mov	ax,[current_address]
+	and	ax,0000fh
+	call	put_hex_num
+	pop	dx 
+	pop	cx 
+	pop	bx 
+	pop	ax
+	ret
+
+put_hex_num:
+	push	ax 
+	push	bx 
+	push	cx 
+	push	dx
+	xchg	ax,bx
+	mov	al,'0'
+	cmp	bx,0ah
+	jb	not_letter
+	mov	al,'A'
+	sub	bx,0ah
+not_letter:
+	add	al,bl
+	mov	ah,12h
+	int	20h
+	pop	dx
+	pop	cx
+	pop	bx
+	pop	ax
+	ret
+
+more:
+	call	new_line
+	mov	ah,10h
+	push	cs
+	pop	ds
+	mov	dx,offset more_string
+	int	20h
+	call	new_line
+	xor	ah,ah
+	int	16h
+	cmp	al,27
+	jne	ret_more
+	mov	byte ptr [ask_for_key],0
+ret_more:
+	ret
+
+ask_for_key	db 1
+line_count	db 0
+eof		db 0
+current_address	dw 0
+intro           db 13,10,'Hex Dumper for DS-OS (c) 1999 by David Sicilia'
+                db 13,10
+                db 13,10,'     Format: DUMP.PGRM file_name.ext'
+                db 13,10
+                db 13,10,0
+more_string     db '-- MORE --',0
+
+cache_pos	dw disk_cache+200h
+cache_size	dw 200h
+
+data	segment
+
+	temp_para	db 10h dup(?)
+	file_size	dw ?
+	handle		dw ?
+	temp_byte	db ?
+	disk_cache	db 512 dup(?)
+
+data	ends
+
+end
