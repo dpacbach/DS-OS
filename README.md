@@ -18,7 +18,5 @@ Work on this project stopped around 1999, but the OS can
 still be run today on a PC-compatible machine or under
 under a virtual machine such as Virtual Box.  For more
 information and some documentation please see the project's
-website (which was also created in the late 90's and
-resurrected):
-
-    http://www.itfromterabit.net/ds-os
+[website](http://www.itfromterabit.net/dsos) (which was
+also created in the late 90's and resurrected).
