@@ -20,3 +20,13 @@ under a virtual machine such as Virtual Box.  For more
 information and some documentation please see the project's
 [website](http://www.itfromterabit.net/dsos) (which was
 also created in the late 90's and resurrected).
+
+Running in VirtualBox
+---------------------
+
+To run this operating system in VirtualBox simply create
+a new VM (choosing the "Other"/"Other Unknown" categories),
+along with a virtual disk (which will not be used).  Then,
+Go into the Settings for the VM, select "Storage", then
+add a new floppy controller, then add the "image.flp" file
+as a disk.  Then just boot the VM and it should work.
